@@ -1,0 +1,44 @@
+# Fork only: publish the Windows wheels built by the wheel builder as a
+# GitHub release, so they can be downloaded without signing in.
+name: Publish fork wheels
+
+on:
+  workflow_run:
+    workflows: ["LuxCore Python Wheels Builder"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run-id:
+        description: "Wheel builder run id to publish"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v5
+        with:
+          pattern: cibw-wheels-*
+          merge-multiple: true
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.run-id }}
+          github-token: ${{ github.token }}
+
+      - name: List wheels
+        run: ls -la dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.event.workflow_run.id || inputs.run-id }}
+          name: LuxCore light linking build ${{ github.event.workflow_run.id || inputs.run-id }}
+          target_commitish: ${{ github.event.workflow_run.head_sha || github.sha }}
+          files: dist/*.whl
+          make_latest: true
