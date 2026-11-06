@@ -1,0 +1,27 @@
+diff --git a/build-system/wheels/build_oidn_cuda_windows.sh b/build-system/wheels/build_oidn_cuda_windows.sh
+index 151a5e0..896c7e2 100644
+--- a/build-system/wheels/build_oidn_cuda_windows.sh
++++ b/build-system/wheels/build_oidn_cuda_windows.sh
+@@ -58,17 +58,18 @@ if ! cmake -S src -B build -G Ninja \
+   exit 0
+ fi
+ 
+-if ! cmake --build build --target LuxOpenImageDenoise_device_cuda; then
++if ! cmake --build build --target OpenImageDenoise_device_cuda; then
+   echo "[OIDN CUDA] build failed, skipping"
+   exit 0
+ fi
+ 
+-module=$(find build -name "LuxOpenImageDenoise_device_cuda.dll" | head -1)
++module=$(find build -name "*device_cuda*.dll" | head -1)
+ if [[ -z "$module" ]]; then
+   echo "[OIDN CUDA] module not found after build, skipping"
+   exit 0
+ fi
+ 
+-cp "$module" "$oidn_bin/"
+-echo "[OIDN CUDA] installed $(basename "$module") into $oidn_bin"
++echo "[OIDN CUDA] built $module"
++cp "$module" "$oidn_bin/LuxOpenImageDenoise_device_cuda.dll"
++echo "[OIDN CUDA] installed LuxOpenImageDenoise_device_cuda.dll into $oidn_bin"
+ ls -la "$oidn_bin"
