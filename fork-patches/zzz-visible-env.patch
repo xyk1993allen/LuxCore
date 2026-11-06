@@ -1,0 +1,274 @@
+diff --git a/include/slg/engines/pathoclbase/kernels/pathoclbase_funcs.cl b/include/slg/engines/pathoclbase/kernels/pathoclbase_funcs.cl
+index 7166952..c561bc2 100644
+--- a/include/slg/engines/pathoclbase/kernels/pathoclbase_funcs.cl
++++ b/include/slg/engines/pathoclbase/kernels/pathoclbase_funcs.cl
+@@ -156,9 +156,23 @@ OPENCL_FORCE_INLINE void GenerateEyePath(
+ // Utility functions
+ //------------------------------------------------------------------------------
+ 
++OPENCL_FORCE_INLINE uint EnvVisibilityRayClass(const uint depth, const BSDFEvent lastBSDFEvent) {
++	if (depth == 0)
++		return 1u; // ENVVIS_CAMERA
++	if ((lastBSDFEvent & REFLECT) && (lastBSDFEvent & (GLOSSY | SPECULAR)))
++		return 2u; // ENVVIS_REFLECT
++	if ((lastBSDFEvent & TRANSMIT) && (lastBSDFEvent & SPECULAR))
++		return 4u; // ENVVIS_REFRACT
++	return 8u; // ENVVIS_OTHER
++}
++
+ OPENCL_FORCE_INLINE bool CheckDirectHitVisibilityFlags(__global const LightSource* restrict lightSource,
+ 		__global PathDepthInfo *depthInfo,
+ 		const BSDFEvent lastBSDFEvent) {
++	// Visible environment: check if the light is seen by this class of rays
++	if (!(lightSource->envVisibilityMask & EnvVisibilityRayClass(depthInfo->depth, lastBSDFEvent)))
++		return false;
++
+ 	if (depthInfo->depth == 0)
+ 		return true;
+ 
+@@ -216,7 +230,7 @@ OPENCL_FORCE_INLINE void DirectHitInfiniteLight(__constant const Film* restrict
+ 
+ 		if (!Spectrum_IsBlack(envRadiance)) {
+ 			float weight;
+-			if (!(pathInfo->lastBSDFEvent & SPECULAR)) {
++			if (!(pathInfo->lastBSDFEvent & SPECULAR) && !light->isVisibleEnv) {
+ 				const float lightPickProb = LightStrategy_SampleLightPdf(lightsDistribution,
+ 						dlscAllEntries,
+ 						dlscDistributions, dlscBVHNodes,
+@@ -323,8 +337,9 @@ OPENCL_FORCE_INLINE bool DirectLight_Illuminate(
+ 
+ 	__global const LightSource* restrict light = &lights[lightIndex];
+ 
+-	// Light linking: the picked light may not illuminate this surface
+-	if (!Light_IsLightLinkedTo(light, bsdf->lightLinkReceiverSet))
++	// Light linking: the picked light may not illuminate this surface.
++	// A visible environment never lights the scene.
++	if (!Light_IsLightLinkedTo(light, bsdf->lightLinkReceiverSet) || light->isVisibleEnv)
+ 		return false;
+ 
+ 	info->lightIndex = lightIndex;
+diff --git a/include/slg/lights/light.h b/include/slg/lights/light.h
+index c965419..1b57155 100644
+--- a/include/slg/lights/light.h
++++ b/include/slg/lights/light.h
+@@ -62,7 +62,8 @@ typedef enum {
+ class LightSource : public luxrays::NamedObject {
+ public:
+ 	LightSource() : NamedObject("light"), lightSceneIndex(0),
+-			volume(nullptr), lightLinkReceiverMask(LIGHTLINK_MASK_ALL), castShadows(true) { }
++			volume(nullptr), lightLinkReceiverMask(LIGHTLINK_MASK_ALL), castShadows(true),
++			visibleEnv(false), visibleEnvClasses(0), envVisibilityMask(ENVVIS_ALL) { }
+ 	virtual ~LightSource() { }
+ 
+ 	virtual void Preprocess() = 0;
+@@ -100,6 +101,19 @@ public:
+ 	virtual bool IsCastingShadows() const { return castShadows; }
+ 	void SetCastShadows(const bool v) { castShadows = v; }
+ 
++	// Visible environment (only for environmental lights)
++	bool IsVisibleEnvironment() const { return visibleEnv; }
++	// The ray classes (ENVVIS_*) seeing this light when it is a visible environment
++	u_int GetVisibleEnvironmentClasses() const { return visibleEnvClasses; }
++	void SetVisibleEnvironment(const bool enable, const u_int classes) {
++		visibleEnv = enable;
++		visibleEnvClasses = classes;
++	}
++	// The ray classes (ENVVIS_*) where a direct hit of this light is visible. It
++	// is computed by LightSourceDefinitions::Preprocess()
++	u_int GetEnvVisibilityMask() const { return envVisibilityMask; }
++	void SetEnvVisibilityMask(const u_int m) { envVisibilityMask = m; }
++
+ 	// Emits particle from the light
+ 	virtual luxrays::Spectrum Emit(SceneConstRef scene,
+ 		const float time, const float u0, const float u1,
+@@ -135,6 +149,8 @@ public:
+ protected:
+ 	LightLinkMask lightLinkReceiverMask;
+ 	bool castShadows;
++	bool visibleEnv;
++	u_int visibleEnvClasses, envVisibilityMask;
+ };
+ 
+ //------------------------------------------------------------------------------
+@@ -177,7 +193,7 @@ public:
+ 
+ 	virtual void Preprocess();
+ 
+-	virtual bool IsDirectLightSamplingEnabled() const { return true; }
++	virtual bool IsDirectLightSamplingEnabled() const { return !visibleEnv; }
+ 
+ 	virtual bool IsVisibleIndirectDiffuse() const { return false; }
+ 	virtual bool IsVisibleIndirectGlossy() const { return false; }
+diff --git a/include/slg/lights/light_types.cl b/include/slg/lights/light_types.cl
+index cb955ed..0e00e4a 100644
+--- a/include/slg/lights/light_types.cl
++++ b/include/slg/lights/light_types.cl
+@@ -169,6 +169,10 @@ typedef struct {
+ 	unsigned int lightLinkMaskLo, lightLinkMaskHi;
+ 	// If false, the light is never occluded
+ 	int castShadows;
++	// Visible environment: is a visible environment and the ray classes
++	// (ENVVIS_*) where a direct hit is visible
++	int isVisibleEnv;
++	unsigned int envVisibilityMask;
+ 	
+ 	union {
+ 		NotIntersectableLightSource notIntersectable;
+diff --git a/include/slg/lights/lightlinking.h b/include/slg/lights/lightlinking.h
+index f2eec0c..e54ebf3 100644
+--- a/include/slg/lights/lightlinking.h
++++ b/include/slg/lights/lightlinking.h
+@@ -53,6 +53,25 @@ inline bool LightLinkMaskIncludes(const LightLinkMask mask, const unsigned int s
+ 	return (mask >> set) & 1ull;
+ }
+ 
++//------------------------------------------------------------------------------
++// Visible environment (like Octane): an environment light can be marked as a
++// "visible environment". It doesn't light the scene, it is only seen by the
++// ray classes enabled (camera rays = backplate, glossy/specular reflections,
++// specular refractions). The other (lighting) environment lights are hidden for
++// the ray classes covered by a visible environment.
++//
++//   scene.lights.<name>.visibleenv.enable = 1
++//   scene.lights.<name>.visibleenv.backplate = 1
++//   scene.lights.<name>.visibleenv.reflections = 1
++//   scene.lights.<name>.visibleenv.refractions = 1
++//------------------------------------------------------------------------------
++
++#define ENVVIS_CAMERA 1u
++#define ENVVIS_REFLECT 2u
++#define ENVVIS_REFRACT 4u
++#define ENVVIS_OTHER 8u
++#define ENVVIS_ALL 15u
++
+ extern unsigned int LightLinkParseReceiverSet(const luxrays::Properties &props, const std::string &propName);
+ extern LightLinkMask LightLinkParseReceiverMask(const luxrays::Properties &props, const std::string &propName);
+ extern luxrays::Property LightLinkReceiverMaskToProperty(const std::string &propName, const LightLinkMask mask);
+diff --git a/src/slg/engines/pathoclbase/compilelights.cpp b/src/slg/engines/pathoclbase/compilelights.cpp
+index d827bef..226985f 100644
+--- a/src/slg/engines/pathoclbase/compilelights.cpp
++++ b/src/slg/engines/pathoclbase/compilelights.cpp
+@@ -333,6 +333,8 @@ void CompiledScene::CompileLights() {
+ 		oclLight->lightLinkMaskLo = (u_int)(lightLinkMask & 0xffffffffull);
+ 		oclLight->lightLinkMaskHi = (u_int)(lightLinkMask >> 32);
+ 		oclLight->castShadows = l.IsCastingShadows();
++		oclLight->isVisibleEnv = l.IsVisibleEnvironment();
++		oclLight->envVisibilityMask = l.GetEnvVisibilityMask();
+ 
+ 		switch (l.GetType()) {
+ 			case TYPE_TRIANGLE: {
+diff --git a/src/slg/engines/pathtracer.cpp b/src/slg/engines/pathtracer.cpp
+index 932b8b3..3043f59 100644
+--- a/src/slg/engines/pathtracer.cpp
++++ b/src/slg/engines/pathtracer.cpp
+@@ -161,8 +161,10 @@ PathTracer::DirectLightResult PathTracer::DirectLightSampling(
+ 			&lightPickPdf
+ 		);
+ 
+-		// Light linking: the picked light may not illuminate this surface
+-		if (light && light->IsLightLinkedTo(bsdf.GetLightLinkReceiverSet())) {
++		// Light linking: the picked light may not illuminate this surface.
++		// A visible environment never lights the scene.
++		if (light && light->IsLightLinkedTo(bsdf.GetLightLinkReceiverSet()) &&
++				!light->IsVisibleEnvironment()) {
+ 			Ray shadowRay;
+ 			float directPdfW;
+ 			Spectrum lightRadiance = light->Illuminate(
+@@ -271,8 +273,22 @@ PathTracer::DirectLightResult PathTracer::DirectLightSampling(
+ 	return NOT_VISIBLE;
+ }
+ 
++static inline u_int EnvVisibilityRayClass(const u_int depth, const BSDFEvent lastBSDFEvent) {
++	if (depth == 0)
++		return ENVVIS_CAMERA;
++	if ((lastBSDFEvent & REFLECT) && (lastBSDFEvent & (GLOSSY | SPECULAR)))
++		return ENVVIS_REFLECT;
++	if ((lastBSDFEvent & TRANSMIT) && (lastBSDFEvent & SPECULAR))
++		return ENVVIS_REFRACT;
++	return ENVVIS_OTHER;
++}
++
+ bool PathTracer::CheckDirectHitVisibilityFlags(LightSourceConstRef lightSource, const PathDepthInfo &depthInfo,
+ 		const BSDFEvent lastBSDFEvent) const {
++	// Visible environment: check if the light is seen by this class of rays
++	if (!(lightSource.GetEnvVisibilityMask() & EnvVisibilityRayClass(depthInfo.depth, lastBSDFEvent)))
++		return false;
++
+ 	if (depthInfo.depth == 0)
+ 		return true;
+ 
+@@ -372,7 +388,7 @@ void PathTracer::DirectHitInfiniteLight(SceneConstRef scene,
+ 		const Spectrum envRadiance = envLight.GetRadiance(scene, bsdf, -ray.d, &directPdfW);
+ 		if (!envRadiance.Black()) {
+ 			float weight;
+-			if (!(pathInfo.lastBSDFEvent & SPECULAR)) {
++			if (!(pathInfo.lastBSDFEvent & SPECULAR) && !envLight.IsVisibleEnvironment()) {
+ 				const float lightPickProb = scene.GetLightSources().GetIlluminateLightStrategy().
+ 						SampleLightPdf(envLight, ray.o, pathInfo.lastShadeN, pathInfo.lastFromVolume);
+ 
+diff --git a/src/slg/lights/light.cpp b/src/slg/lights/light.cpp
+index 881f282..571d129 100644
+--- a/src/slg/lights/light.cpp
++++ b/src/slg/lights/light.cpp
+@@ -38,6 +38,12 @@ PropertiesUPtr LightSource::ToProperties(const ImageMapCache &imgMapCache, const
+ 		props->Set(LightLinkReceiverMaskToProperty(prefix, lightLinkReceiverMask));
+ 	if (!castShadows)
+ 		props->Set(Property(prefix + ".castshadows")(false));
++	if (visibleEnv) {
++		props->Set(Property(prefix + ".visibleenv.enable")(true));
++		props->Set(Property(prefix + ".visibleenv.backplate")((visibleEnvClasses & ENVVIS_CAMERA) != 0));
++		props->Set(Property(prefix + ".visibleenv.reflections")((visibleEnvClasses & ENVVIS_REFLECT) != 0));
++		props->Set(Property(prefix + ".visibleenv.refractions")((visibleEnvClasses & ENVVIS_REFRACT) != 0));
++	}
+ 
+ 	return props;
+ }
+diff --git a/src/slg/lights/lightsourcedefs.cpp b/src/slg/lights/lightsourcedefs.cpp
+index 274c823..81d2758 100644
+--- a/src/slg/lights/lightsourcedefs.cpp
++++ b/src/slg/lights/lightsourcedefs.cpp
+@@ -267,6 +267,23 @@ void LightSourceDefinitions::Preprocess(SceneConstRef scene, const bool useRTMod
+ 		++i;
+ 	}
+ 
++	// Visible environment: compute the ray classes where each light is visible
++	u_int visibleEnvCovered = 0;
++	for (auto const &e : lightsByName) {
++		const LightSource &l = *e.second;
++		if (l.IsEnvironmental() && l.IsVisibleEnvironment())
++			visibleEnvCovered |= l.GetVisibleEnvironmentClasses();
++	}
++	for (auto const &e : lightsByName) {
++		LightSource &l = *e.second;
++		if (!l.IsEnvironmental())
++			l.SetEnvVisibilityMask(ENVVIS_ALL);
++		else if (l.IsVisibleEnvironment())
++			l.SetEnvVisibilityMask(l.GetVisibleEnvironmentClasses());
++		else
++			l.SetEnvVisibilityMask(ENVVIS_ALL & ~visibleEnvCovered);
++	}
++
+ //	const double end1 = WallClockTime();
+ //	SLG_LOG("Light step #1 preprocessing time: " << (end1 - start) << "secs");
+ 
+diff --git a/src/slg/scene/parselights.cpp b/src/slg/scene/parselights.cpp
+index 94b5228..c83ff2c 100644
+--- a/src/slg/scene/parselights.cpp
++++ b/src/slg/scene/parselights.cpp
+@@ -535,6 +535,16 @@ LightSourceUPtr Scene::CreateLightSource(const string &name, const luxrays::Prop
+ 	lightSource->SetImportance(props.Get(Property(propName + ".importance")(1.0)).Get<double>());
+ 	lightSource->SetLightLinkReceiverMask(LightLinkParseReceiverMask(props, propName));
+ 	lightSource->SetCastShadows(props.Get(Property(propName + ".castshadows")(true)).Get<bool>());
++	if (lightSource->IsEnvironmental() &&
++			props.Get(Property(propName + ".visibleenv.enable")(false)).Get<bool>()) {
++		const u_int classes =
++			(props.Get(Property(propName + ".visibleenv.backplate")(true)).Get<bool>() ? ENVVIS_CAMERA : 0u) |
++			(props.Get(Property(propName + ".visibleenv.reflections")(true)).Get<bool>() ? ENVVIS_REFLECT : 0u) |
++			(props.Get(Property(propName + ".visibleenv.refractions")(true)).Get<bool>() ? ENVVIS_REFRACT : 0u);
++		lightSource->SetVisibleEnvironment(true, classes);
++		// A visible environment doesn't light the scene
++		lightSource->SetImportance(0.f);
++	}
+ 
+ 	if (!lightSource->IsIntersectable()) {
+ 		auto& nils = static_cast<NotIntersectableLightSource&>(*lightSource);
