@@ -1,0 +1,581 @@
+diff --git a/build-system/luxmake/windows.py b/build-system/luxmake/windows.py
+index 4fb0161..df54a84 100644
+--- a/build-system/luxmake/windows.py
++++ b/build-system/luxmake/windows.py
+@@ -63,6 +63,16 @@ def win_recompose(args):
+             "LuxOpenImageDenoise_device_cpu.dll",
+         )
+ 
++        # Rename the optional GPU (CUDA) denoising module
++        cuda_module = unpacked_wheel_path / "pyluxcore.libs" / "LuxOpenImageDenoise_device_cuda.pyd"
++        if cuda_module.exists():
++            logger.info("Renaming LuxOpenImageDenoise_device_cuda.pyd into .dll")
++            _rename(
++                unpacked_wheel_path,
++                "LuxOpenImageDenoise_device_cuda.pyd",
++                "LuxOpenImageDenoise_device_cuda.dll",
++            )
++
+         # Repack wheel
+         pack(
+             directory=unpacked_wheel_path,
+diff --git a/build-system/wheels/build_oidn_cuda_windows.sh b/build-system/wheels/build_oidn_cuda_windows.sh
+new file mode 100644
+index 0000000..151a5e0
+--- /dev/null
++++ b/build-system/wheels/build_oidn_cuda_windows.sh
+@@ -0,0 +1,74 @@
++#!/bin/bash
++# SPDX-FileCopyrightText: 2026 Authors (see AUTHORS.txt)
++#
++# SPDX-License-Identifier: Apache-2.0
++#
++# Build the CUDA device module of Open Image Denoise (GPU denoising) with the
++# same version, namespace and library name as the OIDN provided by LuxCoreDeps,
++# and drop it next to the OIDN core library so that it is bundled in the wheel.
++# Requires the CUDA toolkit (CUDA_PATH) and MSVC in the environment.
++# The build is optional: on failure, the wheel is built without GPU denoising.
++
++set -o pipefail
++
++OIDN_VERSION=2.5.0
++workspace=$(cygpath -u "${1:-$GITHUB_WORKSPACE}")
++deps="$workspace/out/dependencies/full_deploy/host"
++oidn_bin="$deps/oidn/$OIDN_VERSION/Release/x86_64/bin"
++
++if [[ -z "${CUDA_PATH}" ]]; then
++  echo "[OIDN CUDA] CUDA_PATH not set, skipping GPU denoiser build"
++  exit 0
++fi
++if [[ ! -d "$oidn_bin" ]]; then
++  echo "[OIDN CUDA] OIDN not found in dependencies ($oidn_bin), skipping"
++  exit 0
++fi
++
++tbb_dir=$(find "$deps/onetbb" -type d -path "*/lib/cmake/TBB" | head -1)
++echo "[OIDN CUDA] CUDA_PATH=${CUDA_PATH}"
++echo "[OIDN CUDA] TBB_DIR=${tbb_dir}"
++
++build_root="$workspace/oidn-cuda"
++rm -rf "$build_root" && mkdir -p "$build_root"
++cd "$build_root" || exit 0
++
++pip install ninja
++
++git lfs install
++if ! git clone --recursive --depth 1 --branch "v${OIDN_VERSION}" \
++    https://github.com/RenderKit/oidn.git src; then
++  echo "[OIDN CUDA] clone failed, skipping"
++  exit 0
++fi
++
++if ! cmake -S src -B build -G Ninja \
++    -DCMAKE_BUILD_TYPE=Release \
++    -DCMAKE_CUDA_FLAGS="-allow-unsupported-compiler" \
++    -DOIDN_DEVICE_CPU=OFF \
++    -DOIDN_DEVICE_CUDA=ON \
++    -DOIDN_DEVICE_CUDA_API=Driver \
++    -DOIDN_API_NAMESPACE=lux \
++    -DOIDN_LIBRARY_NAME=LuxOpenImageDenoise \
++    -DOIDN_APPS=OFF \
++    -DOIDN_FILTER_RT=ON \
++    -DOIDN_FILTER_RTLIGHTMAP=ON \
++    -DTBB_DIR="$(cygpath -m "$tbb_dir")"; then
++  echo "[OIDN CUDA] configure failed, skipping"
++  exit 0
++fi
++
++if ! cmake --build build --target LuxOpenImageDenoise_device_cuda; then
++  echo "[OIDN CUDA] build failed, skipping"
++  exit 0
++fi
++
++module=$(find build -name "LuxOpenImageDenoise_device_cuda.dll" | head -1)
++if [[ -z "$module" ]]; then
++  echo "[OIDN CUDA] module not found after build, skipping"
++  exit 0
++fi
++
++cp "$module" "$oidn_bin/"
++echo "[OIDN CUDA] installed $(basename "$module") into $oidn_bin"
++ls -la "$oidn_bin"
+diff --git a/build-system/wheels/repair_wheel_windows.sh b/build-system/wheels/repair_wheel_windows.sh
+index 4a9384f..2817742 100644
+--- a/build-system/wheels/repair_wheel_windows.sh
++++ b/build-system/wheels/repair_wheel_windows.sh
+@@ -29,7 +29,9 @@ base="$workspace/out/dependencies/full_deploy/host"
+ paths=$(find $base -type d -wholename "*/bin" -print0 | xargs -0 realpath | tr "\n" ":")
+ 
+ # Repair wheel
++# nvcuda.dll comes with the NVIDIA driver (used by the GPU denoising module)
+ delvewheel repair -v \
++  --no-dll "nvcuda.dll" \
+   --add-path="$GITHUB_WORKSPACE/libs" \
+   --add-path="${redist_paths}" \
+   --add-path="${paths}" \
+diff --git a/include/luxcore/luxcoreimpl.h b/include/luxcore/luxcoreimpl.h
+index ccce82e..59e1d72 100644
+--- a/include/luxcore/luxcoreimpl.h
++++ b/include/luxcore/luxcoreimpl.h
+@@ -162,6 +162,8 @@ public:
+ 	virtual bool HasDoneAsyncExecuteImagePipeline() = 0;
+ 
+ 	virtual void ApplyOIDN(const u_int index) = 0;
++	// Same with settings: quality, passes, prefilter.mode, usegpu, oidnmemory
++	virtual void ApplyOIDN(const u_int index, const luxrays::Properties &oidnProps) = 0;
+ 
+ 	friend class RenderSessionImpl;
+ 
+@@ -213,6 +215,7 @@ public:
+ 	virtual bool HasDoneAsyncExecuteImagePipeline() override;
+ 
+ 	virtual void ApplyOIDN(const u_int index) override;
++	virtual void ApplyOIDN(const u_int index, const luxrays::Properties &oidnProps) override;
+ 	virtual slg::FilmRef GetSLGFilm() const override;
+ 
+ 	friend class FilmImpl;
+@@ -259,6 +262,7 @@ public:
+ 	virtual bool HasDoneAsyncExecuteImagePipeline() override;
+ 
+ 	virtual void ApplyOIDN(const u_int index) override;
++	virtual void ApplyOIDN(const u_int index, const luxrays::Properties &oidnProps) override;
+ 
+ 	RenderSessionImplRef renderSession;  // Back link, read/write
+ 
+diff --git a/include/slg/film/imagepipeline/plugins/intel_oidn.h b/include/slg/film/imagepipeline/plugins/intel_oidn.h
+index 08fe7c8..3c82c20 100644
+--- a/include/slg/film/imagepipeline/plugins/intel_oidn.h
++++ b/include/slg/film/imagepipeline/plugins/intel_oidn.h
+@@ -42,9 +42,18 @@ namespace slg {
+ 
+ class IntelOIDN : public ImagePipelinePlugin {
+ public:
++	// prefilterMode: "NONE" (guiding passes are noise free), "FAST" (denoise
++	// color and guiding passes together), "ACCURATE" (prefilter the guiding
++	// passes). passes: "NONE", "ALBEDO", "ALBEDO_NORMAL". quality: "DEFAULT",
++	// "FAST", "BALANCED", "HIGH". useGPU: use a GPU device when available
++	// (falls back to the CPU).
+ 	IntelOIDN(const std::string filterType,
+ 			const int oidnMemLimit, const float sharpness,
+-			bool enablePrefiltering, const float fireflySigma = 0.f);
++			bool enablePrefiltering, const float fireflySigma = 0.f,
++			const std::string &quality = "DEFAULT",
++			const std::string &passes = "ALBEDO_NORMAL",
++			const std::string &prefilterMode = "",
++			const bool useGPU = false);
+ 
+ 	virtual ImagePipelinePlugin *Copy() const;
+ 
+@@ -83,6 +92,12 @@ private:
+ 		ar & enablePrefiltering;
+ 		if (version >= 5)
+ 			ar & fireflySigma;
++		if (version >= 6) {
++			ar & quality;
++			ar & passes;
++			ar & prefilterMode;
++			ar & useGPU;
++		}
+ 	}
+ 
+ 	std::string filterType;
+@@ -93,12 +108,15 @@ private:
+ 	bool enablePrefiltering;
+ 	// Firefly suppression threshold in units of local sigma (0 = off)
+ 	float fireflySigma;
++	// Cycles like options
++	std::string quality, passes, prefilterMode;
++	bool useGPU;
+ };
+ 
+ }
+ 
+ 
+-BOOST_CLASS_VERSION(slg::IntelOIDN, 5)
++BOOST_CLASS_VERSION(slg::IntelOIDN, 6)
+ 
+ BOOST_CLASS_EXPORT_KEY(slg::IntelOIDN)
+ 
+diff --git a/src/luxcore/luxcoreimpl.cpp b/src/luxcore/luxcoreimpl.cpp
+index afe6631..76bbfa0 100644
+--- a/src/luxcore/luxcoreimpl.cpp
++++ b/src/luxcore/luxcoreimpl.cpp
+@@ -466,6 +466,27 @@ bool FilmImplSession::HasDoneAsyncExecuteImagePipeline() {
+ 	return result;
+ }
+ 
++// Builds the OIDN plugin used by Film::ApplyOIDN() from its settings
++static slg::IntelOIDN MakeApplyOIDNPlugin(const luxrays::Properties &p) {
++	using luxrays::Property;
++	return slg::IntelOIDN("RT",
++			p.Get(Property("oidnmemory")(6000)).Get<int>(), 0.f, true, 0.f,
++			p.Get(Property("quality")("DEFAULT")).Get<string>(),
++			p.Get(Property("passes")("ALBEDO_NORMAL")).Get<string>(),
++			p.Get(Property("prefilter.mode")("ACCURATE")).Get<string>(),
++			p.Get(Property("usegpu")(false)).Get<bool>());
++}
++
++void FilmImplSession::ApplyOIDN(const u_int index, const luxrays::Properties &oidnProps) {
++	API_BEGIN("{}", index);
++	slg::IntelOIDN oidn = MakeApplyOIDNPlugin(oidnProps);
++
++	std::unique_lock<std::mutex> lock(renderSession.GetSLGRenderSession().filmMutex);
++	oidn.Apply(*renderSession.GetSLGRenderSession().film, index);
++
++	API_END();
++}
++
+ void FilmImplSession::ApplyOIDN(const u_int index) {
+ 	API_BEGIN("{}", index);
+ 	slg::IntelOIDN oidn("RT", 6000, 0.f, true);
+@@ -677,6 +698,15 @@ bool FilmImplStandalone::HasDoneAsyncExecuteImagePipeline() {
+ 	return result;
+ }
+ 
++void FilmImplStandalone::ApplyOIDN(const u_int index, const luxrays::Properties &oidnProps) {
++	API_BEGIN("{}", index);
++	slg::IntelOIDN oidn = MakeApplyOIDNPlugin(oidnProps);
++
++	oidn.Apply(*standAloneFilm, index);
++
++	API_END();
++}
++
+ void FilmImplStandalone::ApplyOIDN(const u_int index) {
+ 	API_BEGIN("{}", index);
+ 	slg::IntelOIDN oidn("RT", 6000, 0.f, true);
+diff --git a/src/pyluxcore/CMakeLists.txt b/src/pyluxcore/CMakeLists.txt
+index 64abe9d..8b455cc 100644
+--- a/src/pyluxcore/CMakeLists.txt
++++ b/src/pyluxcore/CMakeLists.txt
+@@ -146,6 +146,17 @@ if(WIN32)
+     COMPONENT pyluxcore
+   )
+ 
++  # Optional GPU (CUDA) denoising module, see build_oidn_cuda_windows.sh
++  if(EXISTS "${LUX_OIDN_DENOISE_BINS}/LuxOpenImageDenoise_device_cuda.dll")
++    message(STATUS "OIDN CUDA device module found: GPU denoising enabled")
++    install(
++      PROGRAMS "${LUX_OIDN_DENOISE_BINS}/LuxOpenImageDenoise_device_cuda.dll"
++      DESTINATION "pyluxcore.libs"
++      RENAME "LuxOpenImageDenoise_device_cuda.pyd"
++      COMPONENT pyluxcore
++    )
++  endif()
++
+   ## Delvewheel doesn't handle executables, however we need to delocate oidnDenoise.
+   ## Therefore we had to let Delvewheel believe oidnDenoise is a lib, and now
+   ## we have to make it an executable again...
+diff --git a/src/pyluxcore/pyluxcore.cpp b/src/pyluxcore/pyluxcore.cpp
+index 853591b..9d29087 100644
+--- a/src/pyluxcore/pyluxcore.cpp
++++ b/src/pyluxcore/pyluxcore.cpp
+@@ -941,6 +941,14 @@ static void Film_ApplyOIDN(
+ 	film.ApplyOIDN(imagePipelineIndex);
+ }
+ 
++static void Film_ApplyOIDN2(
++	FilmImpl & film,
++	const size_t imagePipelineIndex,
++	const luxrays::Properties &oidnProps
++) {
++	film.ApplyOIDN(imagePipelineIndex, oidnProps);
++}
++
+ //------------------------------------------------------------------------------
+ // Glue for Camera class
+ //------------------------------------------------------------------------------
+@@ -2491,6 +2499,7 @@ PYBIND11_MODULE(pyluxcore, m) {
+     .def("HasDoneAsyncExecuteImagePipeline", &luxcore::detail::FilmImpl::HasDoneAsyncExecuteImagePipeline)
+     .def("WaitAsyncExecuteImagePipeline", &luxcore::detail::FilmImpl::WaitAsyncExecuteImagePipeline)
+ 	.def("ApplyOIDN", &Film_ApplyOIDN)
++	.def("ApplyOIDN", &Film_ApplyOIDN2)
+   ;
+ 
+   //--------------------------------------------------------------------------
+diff --git a/src/slg/film/filmparse.cpp b/src/slg/film/filmparse.cpp
+index b746c3a..97357d0 100644
+--- a/src/slg/film/filmparse.cpp
++++ b/src/slg/film/filmparse.cpp
+@@ -737,8 +737,13 @@ ImagePipeline *Film::CreateImagePipeline(const Properties &props, const string &
+ 				const float sharpness = Clamp(props.Get(Property(prefix + ".sharpness")(.1)).Get<double>(), 0.0, 1.0);
+ 				const bool enablePrefiltering = props.Get(Property(prefix + ".prefilter.enable")(true)).Get<bool>();
+ 				const float fireflySigma = Max(props.Get(Property(prefix + ".firefly.sigma")(0.0)).Get<double>(), 0.0);
++				const string quality = props.Get(Property(prefix + ".quality")("DEFAULT")).Get<string>();
++				const string passes = props.Get(Property(prefix + ".passes")("ALBEDO_NORMAL")).Get<string>();
++				const string prefilterMode = props.Get(Property(prefix + ".prefilter.mode")("")).Get<string>();
++				const bool useGPU = props.Get(Property(prefix + ".usegpu")(false)).Get<bool>();
+ 
+-				imagePipeline->AddPlugin(new IntelOIDN(filterType, oidnMemLimit, sharpness, enablePrefiltering, fireflySigma));
++				imagePipeline->AddPlugin(new IntelOIDN(filterType, oidnMemLimit, sharpness, enablePrefiltering, fireflySigma,
++						quality, passes, prefilterMode, useGPU));
+ #endif
+ 			} else if (type == "WHITE_BALANCE") {
+ 				const float temperature = Clamp(props.Get(Property(prefix + ".temperature")(6500.0)).Get<double>(), 1000.0, 40000.0);
+diff --git a/src/slg/film/imagepipeline/plugins/intel_oidn.cpp b/src/slg/film/imagepipeline/plugins/intel_oidn.cpp
+index bf3dcf0..881d359 100644
+--- a/src/slg/film/imagepipeline/plugins/intel_oidn.cpp
++++ b/src/slg/film/imagepipeline/plugins/intel_oidn.cpp
+@@ -23,6 +23,8 @@
+ 
+ #include <boost/format.hpp>
+ 
++#include <mutex>
++
+ #include <OpenImageDenoise/oidn.hpp>
+ #include <oneapi/tbb.h>
+ 
+@@ -51,12 +53,18 @@ void errorCallback(void* userPtr, lux::oidn::Error error, const char* message) {
+ }
+ 
+ IntelOIDN::IntelOIDN(const string ft, const int m, const float s, const bool pref,
+-		const float fs) {
++		const float fs, const string &q, const string &p, const string &pm,
++		const bool gpu) {
+ 	filterType = ft;
+ 	oidnMemLimit = m;
+ 	sharpness = s;
+-	enablePrefiltering = pref;
+ 	fireflySigma = fs;
++	quality = q;
++	passes = p;
++	// The old boolean setting maps to ACCURATE (true) or FAST (false)
++	prefilterMode = pm.empty() ? (pref ? "ACCURATE" : "FAST") : pm;
++	enablePrefiltering = (prefilterMode == "ACCURATE");
++	useGPU = gpu;
+ }
+ 
+ IntelOIDN::IntelOIDN() {
+@@ -65,10 +73,102 @@ IntelOIDN::IntelOIDN() {
+ 	sharpness = 0.f;
+ 	enablePrefiltering = true;
+ 	fireflySigma = 0.f;
++	quality = "DEFAULT";
++	passes = "ALBEDO_NORMAL";
++	prefilterMode = "ACCURATE";
++	useGPU = false;
+ }
+ 
+ ImagePipelinePlugin *IntelOIDN::Copy() const {
+-	return new IntelOIDN(filterType, oidnMemLimit, sharpness, enablePrefiltering, fireflySigma);
++	return new IntelOIDN(filterType, oidnMemLimit, sharpness, enablePrefiltering, fireflySigma,
++			quality, passes, prefilterMode, useGPU);
++}
++
++//------------------------------------------------------------------------------
++// OIDN devices are expensive to create (a GPU device takes about a second), so
++// they are created once and reused. GPU devices run one filter at a time.
++//------------------------------------------------------------------------------
++
++namespace {
++
++std::mutex oidnDeviceMutex;
++lux::oidn::DeviceRef oidnCPUDevice, oidnGPUDevice;
++bool oidnGPUDeviceFailed = false;
++// Serializes the filters executed on the GPU device
++std::mutex oidnGPUExecMutex;
++
++lux::oidn::DeviceRef CreateOIDNDevice(const lux::oidn::DeviceType type) {
++	lux::oidn::DeviceRef device = lux::oidn::newDevice(type);
++
++	const char *errorMessage;
++	if (!device || (device.getError(errorMessage) != lux::oidn::Error::None))
++		return lux::oidn::DeviceRef();
++
++	device.set("verbose", 0);
++	if (type == lux::oidn::DeviceType::CPU)
++		device.set("setAffinity", false);
++	device.commit();
++
++	if (device.getError(errorMessage) != lux::oidn::Error::None)
++		return lux::oidn::DeviceRef();
++
++	device.setErrorFunction(errorCallback);
++	return device;
++}
++
++// Returns the device to use and if it is a GPU device
++lux::oidn::DeviceRef GetOIDNDevice(const bool useGPU, bool &isGPU) {
++	std::lock_guard<std::mutex> lock(oidnDeviceMutex);
++
++	if (useGPU && !oidnGPUDeviceFailed) {
++		if (!oidnGPUDevice) {
++			// Look for a GPU device (CUDA, HIP, SYCL or Metal)
++			const int count = lux::oidn::getNumPhysicalDevices();
++			for (int i = 0; i < count; ++i) {
++				const lux::oidn::PhysicalDeviceRef pd(i);
++				const auto type = (lux::oidn::DeviceType)pd.get<int>("type");
++				if (type == lux::oidn::DeviceType::CPU)
++					continue;
++
++				oidnGPUDevice = CreateOIDNDevice(type);
++				if (oidnGPUDevice) {
++					SLG_LOG("IntelOIDNPlugin using GPU device: " << pd.get<std::string>("name"));
++					break;
++				}
++			}
++
++			if (!oidnGPUDevice) {
++				SLG_LOG("IntelOIDNPlugin no usable GPU device found, falling back to the CPU");
++				oidnGPUDeviceFailed = true;
++			}
++		}
++
++		if (oidnGPUDevice) {
++			isGPU = true;
++			return oidnGPUDevice;
++		}
++	}
++
++	if (!oidnCPUDevice) {
++		oidnCPUDevice = CreateOIDNDevice(lux::oidn::DeviceType::CPU);
++		if (!oidnCPUDevice)
++			throw std::runtime_error("IntelOIDNPlugin unable to create the CPU device");
++	}
++
++	isGPU = false;
++	return oidnCPUDevice;
++}
++
++lux::oidn::Quality ParseOIDNQuality(const string &q) {
++	if (q == "HIGH")
++		return lux::oidn::Quality::High;
++	if (q == "BALANCED")
++		return lux::oidn::Quality::Balanced;
++	if (q == "FAST")
++		return lux::oidn::Quality::Fast;
++	return lux::oidn::Quality::Default;
++}
++
+ }
+ 
+ // Scale outliers down to the local median + k * MAD (5x5 window on luma).
+@@ -166,50 +266,52 @@ void IntelOIDN::FilterImage(const string &imageName,
+ 		const float *albedoBuffer, const float *normalBuffer,
+ 		const u_int width, const u_int height, const bool cleanAux) const {
+ 
+-    lux::oidn::DeviceRef device = lux::oidn::newDevice(lux::oidn::DeviceType::CPU);
+-
+-    const char* errorMessage2;
++	bool isGPU = false;
++	lux::oidn::DeviceRef device = GetOIDNDevice(useGPU, isGPU);
+ 
+-    if (device.getError(errorMessage2) != lux::oidn::Error::None) {
+-      throw std::runtime_error(errorMessage2);
+-    }
++	// A GPU device runs one filter at a time
++	std::unique_lock<std::mutex> gpuLock(oidnGPUExecMutex, std::defer_lock);
++	if (isGPU)
++		gpuLock.lock();
+ 
+-    device.setErrorFunction(errorCallback);
+-    device.set("verbose", 3);
+-	device.set("setAffinity", false);
+-    device.commit();
++	// Device owned buffers: GPU devices can not access host memory directly
++	const size_t byteSize = (size_t)width * height * 3 * sizeof(float);
++	lux::oidn::BufferRef colorBuf = device.newBuffer(byteSize);
++	colorBuf.write(0, byteSize, srcBuffer);
++	lux::oidn::BufferRef dstBuf = device.newBuffer(byteSize);
++	lux::oidn::BufferRef albedoBuf, normalBuf;
+ 
+-    lux::oidn::FilterRef filter = device.newFilter(filterType.c_str());
+-
+-    lux::oidn::BufferRef colorBuf = device.newBuffer((float*)srcBuffer, width * height * 3 * sizeof(float));
+-    lux::oidn::BufferRef albedoBuf = device.newBuffer((float*)albedoBuffer, width * height * 3 * sizeof(float));
+-    lux::oidn::BufferRef normalBuf = device.newBuffer((float*)normalBuffer, width * height * 3 * sizeof(float));
+-    lux::oidn::BufferRef dstBuf = device.newBuffer((float*)dstBuffer, width * height * 3 * sizeof(float));
+-
+-
+-    filter.set("hdr", true);
++	lux::oidn::FilterRef filter = device.newFilter(filterType.c_str());
++	filter.set("hdr", true);
+ 	filter.set("cleanAux", cleanAux);
+ 	filter.set("maxMemoryMB", oidnMemLimit);
+-    filter.setImage("color", colorBuf, lux::oidn::Format::Float3, width, height);
+-    if (albedoBuffer) {
+-        filter.setImage("albedo", albedoBuf, lux::oidn::Format::Float3, width, height);
+-
+-        // Normals can only be used if albedo is supplied as well
+-        if (normalBuffer)
+-            filter.setImage("normal", normalBuf, lux::oidn::Format::Float3, width, height);
+-    }
+-    
+-    filter.setImage("output", dstBuf, lux::oidn::Format::Float3, width, height);
+-    filter.commit();
+-
+-    SLG_LOG("IntelOIDNPlugin executing " + imageName + " filter");
++	filter.set("quality", ParseOIDNQuality(quality));
++	filter.setImage("color", colorBuf, lux::oidn::Format::Float3, width, height);
++	if (albedoBuffer) {
++		albedoBuf = device.newBuffer(byteSize);
++		albedoBuf.write(0, byteSize, albedoBuffer);
++		filter.setImage("albedo", albedoBuf, lux::oidn::Format::Float3, width, height);
++
++		// Normals can only be used if albedo is supplied as well
++		if (normalBuffer) {
++			normalBuf = device.newBuffer(byteSize);
++			normalBuf.write(0, byteSize, normalBuffer);
++			filter.setImage("normal", normalBuf, lux::oidn::Format::Float3, width, height);
++		}
++	}
++
++	filter.setImage("output", dstBuf, lux::oidn::Format::Float3, width, height);
++	filter.commit();
++
++	SLG_LOG("IntelOIDNPlugin executing " + imageName + " filter on " << (isGPU ? "GPU" : "CPU"));
+ 	const double startTime = WallClockTime();
+-    filter.execute();
+-	SLG_LOG("IntelOIDNPlugin " + imageName + " filter took: " << (boost::format("%.1f") % (WallClockTime() - startTime)) << "secs");
++	filter.execute();
++	dstBuf.read(0, byteSize, dstBuffer);
++	SLG_LOG("IntelOIDNPlugin " + imageName + " filter took: " << (boost::format("%.2f") % (WallClockTime() - startTime)) << "secs");
+ 
+-    const char *errorMessage;
+-    if (device.getError(errorMessage) != lux::oidn::Error::None)
+-         SLG_LOG("IntelOIDNPlugin " + imageName + " filtering error: " << errorMessage);
++	const char *errorMessage;
++	if (device.getError(errorMessage) != lux::oidn::Error::None)
++		SLG_LOG("IntelOIDNPlugin " + imageName + " filtering error: " << errorMessage);
+ }
+ 
+ 
+@@ -303,28 +405,29 @@ void IntelOIDN::Apply(Film &film, const u_int index) {
+ 	};
+ 
+ 	SLG_LOG("IntelOIDNPlugin preparing inputs");
+-    if (film.HasChannel(Film::ALBEDO)) {
+-        if (film.HasChannel(Film::AVG_SHADING_NORMAL)) {
++	const bool useAlbedo = (passes != "NONE");
++	const bool useNormal = (passes == "ALBEDO_NORMAL");
++	if (useAlbedo && film.HasChannel(Film::ALBEDO)) {
++		if (useNormal && film.HasChannel(Film::AVG_SHADING_NORMAL)) {
+ 			// Prepare both (and parallelize)
+ 			tbb::parallel_invoke(prepareAlbedo, prepareNormal);
+ 		} else {
+ 			// Prepare only albedo
+-			SLG_LOG("[IntelOIDNPlugin] Warning: AVG_SHADING_NORMAL AOV not found");
++			if (useNormal)
++				SLG_LOG("[IntelOIDNPlugin] Warning: AVG_SHADING_NORMAL AOV not found");
+ 			prepareAlbedo();
+-			normalBuffer = float_buffer(3 * pixelCount);
+ 		}
+-	} else {
++	} else if (useAlbedo)
+ 		SLG_LOG("[IntelOIDNPlugin] Warning: ALBEDO AOV not found");
+-		albedoBuffer = float_buffer(3 * pixelCount);
+-		normalBuffer = float_buffer(3 * pixelCount);
+-	}
+ 
+ 
+ 	SLG_LOG("IntelOIDNPlugin filtering image");
+ 	FilterImage("Image Pipeline", inputBuffer, &outputBuffer[0],
+ 			(albedoBuffer.size() > 0) ? &albedoBuffer[0] : nullptr,
+ 			(normalBuffer.size() > 0) ? &normalBuffer[0] : nullptr,
+-			width, height, enablePrefiltering);
++			width, height,
++			// The guiding passes are noise free (NONE) or have been prefiltered (ACCURATE)
++			prefilterMode != "FAST");
+ 
+     SLG_LOG("IntelOIDNPlugin copying output buffer");
+ 	tbb::affinity_partitioner aff_p;
