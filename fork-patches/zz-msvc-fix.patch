@@ -1,0 +1,71 @@
+diff --git a/include/slg/lights/lightlinking.h b/include/slg/lights/lightlinking.h
+index f602e42..f2eec0c 100644
+--- a/include/slg/lights/lightlinking.h
++++ b/include/slg/lights/lightlinking.h
+@@ -36,8 +36,8 @@ namespace slg {
+ // sampling hitting the light, so MIS stays consistent.
+ //
+ // Scene description:
+-//   scene.objects.<name>.lightlink.receiverset = <u_int>
+-//   scene.lights.<name>.lightlink.receiversets = <u_int> <u_int> ...
++//   scene.objects.<name>.lightlink.receiverset = <unsigned int>
++//   scene.lights.<name>.lightlink.receiversets = <unsigned int> <unsigned int> ...
+ //   scene.objects.<name>.lightlink.receiversets = ...  (for emissive objects)
+ //
+ // When ".lightlink.receiversets" is not defined, the light illuminates
+@@ -49,11 +49,11 @@ typedef unsigned long long LightLinkMask;
+ #define LIGHTLINK_SET_COUNT 64u
+ #define LIGHTLINK_MASK_ALL (~0ull)
+ 
+-inline bool LightLinkMaskIncludes(const LightLinkMask mask, const u_int set) {
++inline bool LightLinkMaskIncludes(const LightLinkMask mask, const unsigned int set) {
+ 	return (mask >> set) & 1ull;
+ }
+ 
+-extern u_int LightLinkParseReceiverSet(const luxrays::Properties &props, const std::string &propName);
++extern unsigned int LightLinkParseReceiverSet(const luxrays::Properties &props, const std::string &propName);
+ extern LightLinkMask LightLinkParseReceiverMask(const luxrays::Properties &props, const std::string &propName);
+ extern luxrays::Property LightLinkReceiverMaskToProperty(const std::string &propName, const LightLinkMask mask);
+ 
+diff --git a/src/slg/lights/lightlinking.cpp b/src/slg/lights/lightlinking.cpp
+index 5103abd..e3a072f 100644
+--- a/src/slg/lights/lightlinking.cpp
++++ b/src/slg/lights/lightlinking.cpp
+@@ -25,12 +25,12 @@ using namespace luxrays;
+ 
+ namespace slg {
+ 
+-u_int LightLinkParseReceiverSet(const Properties &props, const string &propName) {
++unsigned int LightLinkParseReceiverSet(const Properties &props, const string &propName) {
+ 	const string name = propName + ".lightlink.receiverset";
+ 	if (!props.IsDefined(name))
+ 		return 0;
+ 
+-	const u_int set = props.Get(name).Get<u_int>();
++	const unsigned int set = props.Get(name).Get<unsigned int>();
+ 	if (set >= LIGHTLINK_SET_COUNT)
+ 		throw runtime_error("Light linking receiver set out of range [0, " +
+ 				to_string(LIGHTLINK_SET_COUNT - 1) + "]: " + name);
+@@ -45,8 +45,8 @@ LightLinkMask LightLinkParseReceiverMask(const Properties &props, const string &
+ 
+ 	const Property &prop = props.Get(name);
+ 	LightLinkMask mask = 0ull;
+-	for (u_int i = 0; i < prop.GetSize(); ++i) {
+-		const u_int set = prop.Get<u_int>(i);
++	for (unsigned int i = 0; i < prop.GetSize(); ++i) {
++		const unsigned int set = prop.Get<unsigned int>(i);
+ 		if (set >= LIGHTLINK_SET_COUNT)
+ 			throw runtime_error("Light linking receiver set out of range [0, " +
+ 					to_string(LIGHTLINK_SET_COUNT - 1) + "]: " + name);
+@@ -58,9 +58,9 @@ LightLinkMask LightLinkParseReceiverMask(const Properties &props, const string &
+ 
+ Property LightLinkReceiverMaskToProperty(const string &propName, const LightLinkMask mask) {
+ 	Property prop(propName + ".lightlink.receiversets");
+-	for (u_int i = 0; i < LIGHTLINK_SET_COUNT; ++i) {
++	for (unsigned int i = 0; i < LIGHTLINK_SET_COUNT; ++i) {
+ 		if (LightLinkMaskIncludes(mask, i))
+-			prop.Add<u_int>(i);
++			prop.Add<unsigned int>(i);
+ 	}
+ 
+ 	return prop;
