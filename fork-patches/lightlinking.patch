@@ -1,0 +1,858 @@
+line1
+	line2
+line3
+diff --git a/include/slg/bsdf/bsdf.h b/include/slg/bsdf/bsdf.h
+index 371857d..dca790a 100644
+--- a/include/slg/bsdf/bsdf.h
++++ b/include/slg/bsdf/bsdf.h
+@@ -116,6 +116,7 @@ public:
+ 	bool IsShadowCatcher() const { return material->IsShadowCatcher(); }
+ 	bool IsShadowCatcherOnlyInfiniteLights() const { return material->IsShadowCatcherOnlyInfiniteLights(); }
+ 	bool IsCameraInvisible() const;
++	u_int GetLightLinkReceiverSet() const;
+ 	bool IsVolume() const {
+ 		auto ptr = dynamic_observer_cast<const Volume>(material);
+ 		return bool(ptr);
+diff --git a/include/slg/bsdf/bsdf_funcs.cl b/include/slg/bsdf/bsdf_funcs.cl
+index 2d5f5b2..4e7ea94 100644
+--- a/include/slg/bsdf/bsdf_funcs.cl
++++ b/include/slg/bsdf/bsdf_funcs.cl
+@@ -47,6 +47,7 @@ OPENCL_FORCE_INLINE void BSDF_Init(
+ 
+ 	// Save the scene object index
+ 	bsdf->sceneObjectIndex = meshIndex;
++	bsdf->lightLinkReceiverSet = sceneObjs[meshIndex].lightLinkReceiverSet;
+ 
+ 	// Get the material
+ 	const uint matIndex = sceneObjs[meshIndex].materialIndex;
+@@ -111,6 +112,7 @@ OPENCL_FORCE_INLINE void BSDF_InitVolume(
+ 	VSTORE3F(geometryN, &bsdf->hitPoint.fixedDir.x);
+ 
+ 	bsdf->sceneObjectIndex = NULL_INDEX;
++	bsdf->lightLinkReceiverSet = 0;
+ 	Matrix4x4_IdentityGlobal(&bsdf->hitPoint.localToWorld.m);
+ 	bsdf->materialIndex = volumeIndex;
+ 
+diff --git a/include/slg/bsdf/bsdf_types.cl b/include/slg/bsdf/bsdf_types.cl
+index e818790..c70d2c8 100644
+--- a/include/slg/bsdf/bsdf_types.cl
++++ b/include/slg/bsdf/bsdf_types.cl
+@@ -42,6 +42,8 @@ typedef struct {
+ 	HitPoint hitPoint;
+ 
+ 	unsigned int materialIndex, sceneObjectIndex;
++	// Light linking receiver set of the hit object
++	unsigned int lightLinkReceiverSet;
+ 	unsigned int triangleLightSourceIndex;
+ 
+ 	Frame frame;
+diff --git a/include/slg/engines/pathoclbase/kernels/pathoclbase_datatypes.cl b/include/slg/engines/pathoclbase/kernels/pathoclbase_datatypes.cl
+index d7c125a..8e677e8 100644
+--- a/include/slg/engines/pathoclbase/kernels/pathoclbase_datatypes.cl
++++ b/include/slg/engines/pathoclbase/kernels/pathoclbase_datatypes.cl
+@@ -83,6 +83,10 @@ typedef struct {
+ 	Spectrum lightIrradiance;
+ 
+ 	unsigned int lightID;
++
++	// The MIS weight applied to lightRadiance (used to remove MIS when the
++	// shadow ray passes through a shadow invisible object)
++	float misWeight;
+ } DirectLightIlluminateInfo;
+ 
+ // The state used to keep track of the rendered path
+diff --git a/include/slg/engines/pathoclbase/kernels/pathoclbase_funcs.cl b/include/slg/engines/pathoclbase/kernels/pathoclbase_funcs.cl
+index 716a5d3..7166952 100644
+--- a/include/slg/engines/pathoclbase/kernels/pathoclbase_funcs.cl
++++ b/include/slg/engines/pathoclbase/kernels/pathoclbase_funcs.cl
+@@ -172,6 +172,23 @@ OPENCL_FORCE_INLINE bool CheckDirectHitVisibilityFlags(__global const LightSourc
+ 	return false;
+ }
+ 
++OPENCL_FORCE_INLINE bool CheckDirectHitLightLinking(__global const LightSource* restrict lightSource,
++		__global EyePathInfo *pathInfo) {
++	// Camera rays always see light sources
++	if (pathInfo->depth.depth == 0)
++		return true;
++
++	return Light_IsLightLinkedTo(lightSource, pathInfo->lastLightLinkReceiverSet);
++}
++
++OPENCL_FORCE_INLINE bool CheckDirectHitCastShadows(__global const LightSource* restrict lightSource,
++		__global EyePathInfo *pathInfo) {
++	// The contribution of lights not casting shadows comes only from direct light sampling
++	return (pathInfo->depth.depth == 0) || lightSource->castShadows ||
++			!lightSource->isDirectLightSamplingEnabled ||
++			(pathInfo->lastBSDFEvent & SPECULAR);
++}
++
+ OPENCL_FORCE_INLINE void DirectHitInfiniteLight(__constant const Film* restrict film,
+ 		__global EyePathInfo *pathInfo, __global const Spectrum* restrict pathThroughput,
+ 		const __global Ray *ray, __global const BSDF *bsdf, __global SampleResult *sampleResult
+@@ -187,7 +204,9 @@ OPENCL_FORCE_INLINE void DirectHitInfiniteLight(__constant const Film* restrict
+ 		__global const LightSource* restrict light = &lights[envLightIndices[i]];
+ 
+ 		// Check if the light source is visible according the settings
+-		if (!CheckDirectHitVisibilityFlags(light, &pathInfo->depth, pathInfo->lastBSDFEvent))
++		if (!CheckDirectHitVisibilityFlags(light, &pathInfo->depth, pathInfo->lastBSDFEvent) ||
++				!CheckDirectHitLightLinking(light, pathInfo) ||
++				!CheckDirectHitCastShadows(light, pathInfo))
+ 			continue;
+ 
+ 		float directPdfW;
+@@ -226,6 +245,9 @@ OPENCL_FORCE_INLINE void DirectHitFiniteLight(__constant const Film* restrict fi
+ 
+ 	// Check if the light source is visible according the settings
+ 	if (!CheckDirectHitVisibilityFlags(light, &pathInfo->depth, pathInfo->lastBSDFEvent) ||
++			// Light linking: check if the light illuminates the previous path vertex
++			!CheckDirectHitLightLinking(light, pathInfo) ||
++			!CheckDirectHitCastShadows(light, pathInfo) ||
+ 			// If the material is shadow transparent, Direct Light sampling
+ 			// will take care of transporting all emitted light
+ 			bsdf->hitPoint.throughShadowTransparency)
+@@ -301,6 +323,10 @@ OPENCL_FORCE_INLINE bool DirectLight_Illuminate(
+ 
+ 	__global const LightSource* restrict light = &lights[lightIndex];
+ 
++	// Light linking: the picked light may not illuminate this surface
++	if (!Light_IsLightLinkedTo(light, bsdf->lightLinkReceiverSet))
++		return false;
++
+ 	info->lightIndex = lightIndex;
+ 	info->lightID = light->lightID;
+ 	info->pickPdf = lightPickPdf;
+@@ -379,9 +405,12 @@ OPENCL_FORCE_INLINE bool DirectLight_BSDFSampling(
+ 	const bool misEnabled = !lastPathVertex &&
+ 			Light_IsEnvOrIntersectable(light) &&
+ 			CheckDirectHitVisibilityFlags(light, tmpDepthInfo, event) &&
++			// No MIS for lights not casting shadows
++			light->castShadows &&
+ 			!bsdf->hitPoint.throughShadowTransparency;
+ 
+ 	const float weight = misEnabled ? PowerHeuristic(directLightSamplingPdfW, bsdfPdfW) : 1.f;
++	info->misWeight = weight;
+ 
+ 	const float3 lightRadiance = VLOAD3F(info->lightRadiance.c);
+ 	VSTORE3F(bsdfEval * (weight * factor) * lightRadiance, info->lightRadiance.c);
+diff --git a/include/slg/engines/pathoclbase/kernels/pathoclbase_kernels_micro.cl b/include/slg/engines/pathoclbase/kernels/pathoclbase_kernels_micro.cl
+index 5d13feb..aa4e314 100644
+--- a/include/slg/engines/pathoclbase/kernels/pathoclbase_kernels_micro.cl
++++ b/include/slg/engines/pathoclbase/kernels/pathoclbase_kernels_micro.cl
+@@ -487,7 +487,9 @@ __kernel void AdvancePaths_MK_RT_DL(
+ 	taskDirectLight->seedPassThroughEvent = seedPassThroughEvent;
+ 
+ 	int throughShadowTransparency = taskDirectLight->throughShadowTransparency;
+-	const bool continueToTrace =
++	// A light not casting shadows is never occluded
++	const bool lightCastsShadows = lights[taskDirectLight->illumInfo.lightIndex].castShadows;
++	const bool continueToTrace = lightCastsShadows &&
+ 		Scene_Intersect(taskConfig,
+ 			EYE_RAY | SHADOW_RAY,
+ 			&throughShadowTransparency,
+@@ -504,7 +506,7 @@ __kernel void AdvancePaths_MK_RT_DL(
+ 	VSTORE3F(connectionThroughput * VLOAD3F(taskDirectLight->illumInfo.lightRadiance.c), taskDirectLight->illumInfo.lightRadiance.c);
+ 	VSTORE3F(connectionThroughput * VLOAD3F(taskDirectLight->illumInfo.lightIrradiance.c), taskDirectLight->illumInfo.lightIrradiance.c);
+ 
+-	const bool rayMiss = (rayHits[gid].meshIndex == NULL_INDEX);
++	const bool rayMiss = !lightCastsShadows || (rayHits[gid].meshIndex == NULL_INDEX);
+ 
+ 	// If continueToTrace, there is nothing to do, just keep the same state
+ 	if (!continueToTrace) {
+@@ -514,7 +516,11 @@ __kernel void AdvancePaths_MK_RT_DL(
+ 			__global BSDF *bsdf = &taskState->bsdf;
+ 
+ 			if (!BSDF_IsShadowCatcher(bsdf MATERIALS_PARAM)) {
+-				const float3 lightRadiance = VLOAD3F(taskDirectLight->illumInfo.lightRadiance.c);
++				float3 lightRadiance = VLOAD3F(taskDirectLight->illumInfo.lightRadiance.c);
++				// The shadow ray passed through a shadow invisible object: BSDF
++				// sampling can not reach the light source so remove the MIS weight
++				if ((throughShadowTransparency & 2) && (taskDirectLight->illumInfo.misWeight > 0.f))
++					lightRadiance /= taskDirectLight->illumInfo.misWeight;
+ 				SampleResult_AddDirectLight(&taskConfig->film,
+ 						sampleResult, taskDirectLight->illumInfo.lightID,
+ 						BSDF_GetEventTypes(bsdf
+diff --git a/include/slg/engines/pathtracer.h b/include/slg/engines/pathtracer.h
+index af7246b..8255081 100644
+--- a/include/slg/engines/pathtracer.h
++++ b/include/slg/engines/pathtracer.h
+@@ -200,6 +200,10 @@ private:
+ 			const BSDF *bsdf, SampleResult *sampleResult) const;
+ 	bool CheckDirectHitVisibilityFlags(LightSourceConstRef lightSource,
+ 			const PathDepthInfo &depthInfo,	const BSDFEvent lastBSDFEvent) const;
++	bool CheckDirectHitLightLinking(LightSourceConstRef lightSource,
++			const EyePathInfo &pathInfo) const;
++	bool CheckDirectHitCastShadows(LightSourceConstRef lightSource,
++			const EyePathInfo &pathInfo) const;
+ 
+ 	// RenderLightSample methods
+ 
+diff --git a/include/slg/lights/light.h b/include/slg/lights/light.h
+index f2c4aaa..c965419 100644
+--- a/include/slg/lights/light.h
++++ b/include/slg/lights/light.h
+@@ -29,6 +29,7 @@
+ #include "luxrays/core/color/spds/irregular.h"
+ #include "luxrays/core/namedobject.h"
+ #include "luxrays/utils/mcdistribution.h"
++#include "slg/lights/lightlinking.h"
+ #include "slg/usings.h"
+ #include "slg/textures/texture.h"
+ #include "slg/textures/mapping/mapping.h"
+@@ -61,7 +62,7 @@ typedef enum {
+ class LightSource : public luxrays::NamedObject {
+ public:
+ 	LightSource() : NamedObject("light"), lightSceneIndex(0),
+-			volume(nullptr) { }
++			volume(nullptr), lightLinkReceiverMask(LIGHTLINK_MASK_ALL), castShadows(true) { }
+ 	virtual ~LightSource() { }
+ 
+ 	virtual void Preprocess() = 0;
+@@ -87,6 +88,18 @@ public:
+ 	virtual bool IsVisibleIndirectGlossy() const = 0;
+ 	virtual bool IsVisibleIndirectSpecular() const = 0;
+ 
++	// Light linking: the mask of receiver sets illuminated by this light
++	virtual LightLinkMask GetLightLinkReceiverMask() const { return lightLinkReceiverMask; }
++	void SetLightLinkReceiverMask(const LightLinkMask m) { lightLinkReceiverMask = m; }
++	// Light linking: true if the light illuminates the given receiver set
++	bool IsLightLinkedTo(const u_int receiverSet) const {
++		return LightLinkMaskIncludes(GetLightLinkReceiverMask(), receiverSet);
++	}
++
++	// If false, the light is never occluded (it doesn't cast shadows)
++	virtual bool IsCastingShadows() const { return castShadows; }
++	void SetCastShadows(const bool v) { castShadows = v; }
++
+ 	// Emits particle from the light
+ 	virtual luxrays::Spectrum Emit(SceneConstRef scene,
+ 		const float time, const float u0, const float u1,
+@@ -118,6 +131,10 @@ public:
+ 
+ 	u_int lightSceneIndex;
+ 	VolumeConstPtr volume;
++
++protected:
++	LightLinkMask lightLinkReceiverMask;
++	bool castShadows;
+ };
+ 
+ //------------------------------------------------------------------------------
+diff --git a/include/slg/lights/light_funcs.cl b/include/slg/lights/light_funcs.cl
+index 1b993dd..6658ab1 100644
+--- a/include/slg/lights/light_funcs.cl
++++ b/include/slg/lights/light_funcs.cl
+@@ -1293,6 +1293,12 @@ OPENCL_FORCE_INLINE float3 Light_Illuminate(
+ 	}
+ }
+ 
++OPENCL_FORCE_INLINE bool Light_IsLightLinkedTo(__global const LightSource *light, const uint receiverSet) {
++	return (receiverSet < 32) ?
++		((light->lightLinkMaskLo >> receiverSet) & 1u) :
++		((light->lightLinkMaskHi >> (receiverSet - 32)) & 1u);
++}
++
+ OPENCL_FORCE_INLINE bool Light_IsEnvOrIntersectable(__global const LightSource *light) {
+ 	switch (light->type) {
+ 		case TYPE_IL_CONSTANT:
+diff --git a/include/slg/lights/light_types.cl b/include/slg/lights/light_types.cl
+index b3f745c..cb955ed 100644
+--- a/include/slg/lights/light_types.cl
++++ b/include/slg/lights/light_types.cl
+@@ -165,6 +165,10 @@ typedef struct {
+ 	// an OR of DIFFUSE, GLOSSY and SPECULAR.
+ 	BSDFEvent visibility;
+ 	int isDirectLightSamplingEnabled;
++	// Light linking: mask of the illuminated receiver sets (low and high 32 bits)
++	unsigned int lightLinkMaskLo, lightLinkMaskHi;
++	// If false, the light is never occluded
++	int castShadows;
+ 	
+ 	union {
+ 		NotIntersectableLightSource notIntersectable;
+diff --git a/include/slg/lights/lightlinking.h b/include/slg/lights/lightlinking.h
+new file mode 100644
+index 0000000..f602e42
+--- /dev/null
++++ b/include/slg/lights/lightlinking.h
+@@ -0,0 +1,62 @@
++/***************************************************************************
++ * Copyright 1998-2026 by authors (see AUTHORS.txt)                        *
++ *                                                                         *
++ *   This file is part of LuxCoreRender.                                   *
++ *                                                                         *
++ * Licensed under the Apache License, Version 2.0 (the "License");         *
++ * you may not use this file except in compliance with the License.        *
++ * You may obtain a copy of the License at                                 *
++ *                                                                         *
++ *     http://www.apache.org/licenses/LICENSE-2.0                          *
++ *                                                                         *
++ * Unless required by applicable law or agreed to in writing, software     *
++ * distributed under the License is distributed on an "AS IS" BASIS,       *
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.*
++ * See the License for the specific language governing permissions and     *
++ * limitations under the License.                                          *
++ ***************************************************************************/
++
++#ifndef _SLG_LIGHTLINKING_H
++#define	_SLG_LIGHTLINKING_H
++
++#include <string>
++
++#include "luxrays/utils/properties.h"
++
++namespace slg {
++
++//------------------------------------------------------------------------------
++// Light linking
++//
++// Every scene object belongs to one "receiver set" (an index in
++// [0, LIGHTLINK_SET_COUNT), 0 being the default set). Every light source has a
++// mask of the receiver sets it illuminates (all sets by default). When a light
++// does not include the receiver set of a surface, its direct contribution to
++// that surface is removed, both from direct light sampling and from BSDF
++// sampling hitting the light, so MIS stays consistent.
++//
++// Scene description:
++//   scene.objects.<name>.lightlink.receiverset = <u_int>
++//   scene.lights.<name>.lightlink.receiversets = <u_int> <u_int> ...
++//   scene.objects.<name>.lightlink.receiversets = ...  (for emissive objects)
++//
++// When ".lightlink.receiversets" is not defined, the light illuminates
++// everything.
++//------------------------------------------------------------------------------
++
++typedef unsigned long long LightLinkMask;
++
++#define LIGHTLINK_SET_COUNT 64u
++#define LIGHTLINK_MASK_ALL (~0ull)
++
++inline bool LightLinkMaskIncludes(const LightLinkMask mask, const u_int set) {
++	return (mask >> set) & 1ull;
++}
++
++extern u_int LightLinkParseReceiverSet(const luxrays::Properties &props, const std::string &propName);
++extern LightLinkMask LightLinkParseReceiverMask(const luxrays::Properties &props, const std::string &propName);
++extern luxrays::Property LightLinkReceiverMaskToProperty(const std::string &propName, const LightLinkMask mask);
++
++}
++
++#endif	/* _SLG_LIGHTLINKING_H */
+diff --git a/include/slg/lights/trianglelight.h b/include/slg/lights/trianglelight.h
+index ce7de01..447acfd 100644
+--- a/include/slg/lights/trianglelight.h
++++ b/include/slg/lights/trianglelight.h
+@@ -41,6 +41,10 @@ public:
+ 
+ 	virtual bool IsDirectLightSamplingEnabled() const;
+ 
++	// Light linking settings come from the emitting scene object
++	virtual LightLinkMask GetLightLinkReceiverMask() const;
++	virtual bool IsCastingShadows() const;
++
+ 	float GetTriangleArea() const { return triangleArea; }
+ 	float GetMeshArea() const { return meshArea; }
+ 
+diff --git a/include/slg/scene/scene_funcs.cl b/include/slg/scene/scene_funcs.cl
+index 7efccc5..c4865f5 100644
+--- a/include/slg/scene/scene_funcs.cl
++++ b/include/slg/scene/scene_funcs.cl
+@@ -116,6 +116,14 @@ OPENCL_FORCE_NOT_INLINE bool Scene_Intersect(
+ 			}
+ 		}
+ 
++		// Check if it is a shadow invisible object and we are tracing a shadow ray
++		if (!continueToTrace && shadowRay && sceneObjs[rayHit->meshIndex].shadowInvisible) {
++			// Bit 2 marks the crossing of a shadow invisible object: BSDF
++			// sampling can not reach the light so MIS must be removed
++			*throughShadowTransparency |= 2;
++			continueToTrace = true;
++		}
++
+ 		if (!continueToTrace && shadowRay) {
+ 			const float3 shadowTransparency = BSDF_GetPassThroughShadowTransparency(bsdf
+ 				MATERIALS_PARAM);
+diff --git a/include/slg/scene/sceneobject.h b/include/slg/scene/sceneobject.h
+index 5c1bab2..a6c0aa7 100644
+--- a/include/slg/scene/sceneobject.h
++++ b/include/slg/scene/sceneobject.h
+@@ -23,6 +23,7 @@
+ #include "luxrays/core/namedobject.h"
+ #include "luxrays/utils/properties.h"
+ #include "slg/materials/material.h"
++#include "slg/lights/lightlinking.h"
+ #include "slg/scene/extmeshcache.h"
+ #include <functional>
+ 
+@@ -49,7 +50,9 @@ public:
+ 		MaterialRef mt,
+ 		const u_int id,
+ 		const bool invisib)
+-	: NamedObject("obj"), mesh(m), mat(mt), objID(id), bakeMap(nullptr), cameraInvisible(invisib)
++	: NamedObject("obj"), mesh(m), mat(mt), objID(id), bakeMap(nullptr), cameraInvisible(invisib),
++		shadowInvisible(false), lightLinkReceiverSet(0), lightLinkReceiverMask(LIGHTLINK_MASK_ALL),
++		lightCastShadows(true)
+ 	{ }
+ 	virtual ~SceneObject() { }
+ 
+@@ -60,6 +63,29 @@ public:
+ 	u_int GetID() const { return objID; }
+ 	bool IsCameraInvisible() const { return cameraInvisible; }
+ 
++	// The object doesn't block shadow rays (i.e. it doesn't cast shadows)
++	bool IsShadowInvisible() const { return shadowInvisible; }
++	void SetShadowInvisible(const bool v) { shadowInvisible = v; }
++
++	// Light linking: the receiver set of this object
++	u_int GetLightLinkReceiverSet() const { return lightLinkReceiverSet; }
++	void SetLightLinkReceiverSet(const u_int s) { lightLinkReceiverSet = s; }
++	// Light linking: the receiver sets illuminated by this object, used only
++	// if the object is emissive (i.e. by its triangle lights)
++	LightLinkMask GetLightLinkReceiverMask() const { return lightLinkReceiverMask; }
++	void SetLightLinkReceiverMask(const LightLinkMask m) { lightLinkReceiverMask = m; }
++	// If the object is emissive: false if its light is never occluded
++	bool IsLightCastingShadows() const { return lightCastShadows; }
++	void SetLightCastShadows(const bool v) { lightCastShadows = v; }
++
++	// Copy the visibility and light linking settings from another object
++	void CopyVisibilitySettings(const SceneObject &obj) {
++		shadowInvisible = obj.shadowInvisible;
++		lightLinkReceiverSet = obj.lightLinkReceiverSet;
++		lightLinkReceiverMask = obj.lightLinkReceiverMask;
++		lightCastShadows = obj.lightCastShadows;
++	}
++
+ 	void SetMaterial(MaterialRef newMat) {
+ 		mat = newMat;
+ 	}
+@@ -100,6 +126,10 @@ private:
+ 	u_int bakeMapUVIndex;
+ 
+ 	bool cameraInvisible;
++	bool shadowInvisible;
++	u_int lightLinkReceiverSet;
++	LightLinkMask lightLinkReceiverMask;
++	bool lightCastShadows;
+ };
+ 
+ 
+diff --git a/include/slg/scene/sceneobject_types.cl b/include/slg/scene/sceneobject_types.cl
+index ae2fb3c..6ac95e9 100644
+--- a/include/slg/scene/sceneobject_types.cl
++++ b/include/slg/scene/sceneobject_types.cl
+@@ -32,5 +32,8 @@ typedef struct {
+ 	unsigned int  bakeMapUVIndex;
+ 
+ 	int cameraInvisible;
++	int shadowInvisible;
++	// Light linking receiver set
++	unsigned int lightLinkReceiverSet;
+ } SceneObject;
+ // vim: autoindent noexpandtab tabstop=4 shiftwidth=4
+diff --git a/include/slg/utils/pathinfo.h b/include/slg/utils/pathinfo.h
+index 81b7546..19905a2 100644
+--- a/include/slg/utils/pathinfo.h
++++ b/include/slg/utils/pathinfo.h
+@@ -87,6 +87,8 @@ public:
+ 	float lastGlossiness;
+ 	luxrays::Normal lastShadeN;
+ 	bool lastFromVolume, isTransmittedPath;
++	// Light linking receiver set of the last path vertex
++	u_int lastLightLinkReceiverSet;
+ 
+ private:
+ 	bool isNearlyCaustic;
+diff --git a/include/slg/utils/pathinfo_funcs.cl b/include/slg/utils/pathinfo_funcs.cl
+index 14a238a..0361ce6 100644
+--- a/include/slg/utils/pathinfo_funcs.cl
++++ b/include/slg/utils/pathinfo_funcs.cl
+@@ -33,6 +33,7 @@ OPENCL_FORCE_INLINE void EyePathInfo_Init(__global EyePathInfo *pathInfo) {
+ 	pathInfo->lastGlossiness = 0.f;
+ 	pathInfo->lastFromVolume = false;
+ 	pathInfo->isTransmittedPath = true;
++	pathInfo->lastLightLinkReceiverSet = 0;
+ 
+ 	pathInfo->isNearlyCaustic = false;
+ 	pathInfo->isNearlyS = false;
+@@ -107,6 +108,7 @@ OPENCL_FORCE_INLINE void EyePathInfo_AddVertex(__global EyePathInfo *pathInfo,
+ 	VSTORE3F(bsdf->hitPoint.intoObject ? shadeN : -shadeN, &pathInfo->lastShadeN.x);
+ 	pathInfo->lastFromVolume =  bsdf->isVolume;
+ 	pathInfo->lastGlossiness = glossiness;
++	pathInfo->lastLightLinkReceiverSet = bsdf->lightLinkReceiverSet;
+ 	
+ 	pathInfo->isTransmittedPath = pathInfo->isTransmittedPath && (event & TRANSMIT) && (event & (SPECULAR | GLOSSY));
+ }
+diff --git a/include/slg/utils/pathinfo_types.cl b/include/slg/utils/pathinfo_types.cl
+index 6835b5a..5d3e56c 100644
+--- a/include/slg/utils/pathinfo_types.cl
++++ b/include/slg/utils/pathinfo_types.cl
+@@ -30,6 +30,8 @@ typedef struct {
+ 	float lastGlossiness;
+ 	Normal lastShadeN;
+ 	bool lastFromVolume, isTransmittedPath;
++	// Light linking receiver set of the last path vertex
++	unsigned int lastLightLinkReceiverSet;
+ 
+ 	int isNearlyCaustic;
+ 	// Specular, Specular+ Diffuse and Specular+ Diffuse Specular+ paths
+diff --git a/src/slg/CMakeLists.txt b/src/slg/CMakeLists.txt
+index 5a0798e..3b70b9c 100644
+--- a/src/slg/CMakeLists.txt
++++ b/src/slg/CMakeLists.txt
+@@ -212,6 +212,7 @@ set(SLG_CORE_SRCS
+   ${PROJECT_SOURCE_DIR}/src/slg/lights/infinitelight.cpp
+   ${PROJECT_SOURCE_DIR}/src/slg/lights/laserlight.cpp
+   ${PROJECT_SOURCE_DIR}/src/slg/lights/light.cpp
++  ${PROJECT_SOURCE_DIR}/src/slg/lights/lightlinking.cpp
+   ${PROJECT_SOURCE_DIR}/src/slg/lights/lightsourcedefs.cpp
+   ${PROJECT_SOURCE_DIR}/src/slg/lights/mapspherelight.cpp
+   ${PROJECT_SOURCE_DIR}/src/slg/lights/mappointlight.cpp
+diff --git a/src/slg/bsdf/bsdf.cpp b/src/slg/bsdf/bsdf.cpp
+index 42d8fe2..a2c17e9 100644
+--- a/src/slg/bsdf/bsdf.cpp
++++ b/src/slg/bsdf/bsdf.cpp
+@@ -199,6 +199,10 @@ bool BSDF::IsAlbedoEndPoint(const AlbedoSpecularSetting albedoSpecularSetting,
+ 	}
+ }
+ 
++u_int BSDF::GetLightLinkReceiverSet() const {
++	return (sceneObject) ? sceneObject->GetLightLinkReceiverSet() : 0;
++}
++
+ bool BSDF::IsCameraInvisible() const {
+ 	return (sceneObject) ? sceneObject->IsCameraInvisible() : false;
+ }
+diff --git a/src/slg/engines/pathoclbase/compilelights.cpp b/src/slg/engines/pathoclbase/compilelights.cpp
+index 8d199a2..d827bef 100644
+--- a/src/slg/engines/pathoclbase/compilelights.cpp
++++ b/src/slg/engines/pathoclbase/compilelights.cpp
+@@ -329,6 +329,10 @@ void CompiledScene::CompileLights() {
+ 				(l.IsVisibleIndirectGlossy() ? GLOSSY : NONE) |
+ 				(l.IsVisibleIndirectSpecular() ? SPECULAR : NONE);
+ 		oclLight->isDirectLightSamplingEnabled = l.IsDirectLightSamplingEnabled();
++		const LightLinkMask lightLinkMask = l.GetLightLinkReceiverMask();
++		oclLight->lightLinkMaskLo = (u_int)(lightLinkMask & 0xffffffffull);
++		oclLight->lightLinkMaskHi = (u_int)(lightLinkMask >> 32);
++		oclLight->castShadows = l.IsCastingShadows();
+ 
+ 		switch (l.GetType()) {
+ 			case TYPE_TRIANGLE: {
+diff --git a/src/slg/engines/pathoclbase/compilesceneobjects.cpp b/src/slg/engines/pathoclbase/compilesceneobjects.cpp
+index 6c10ee3..dd2cdf8 100644
+--- a/src/slg/engines/pathoclbase/compilesceneobjects.cpp
++++ b/src/slg/engines/pathoclbase/compilesceneobjects.cpp
+@@ -62,6 +62,8 @@ void CompiledScene::CompileSceneObjects() {
+ 		}
+ 
+ 		oclScnObj.cameraInvisible = scnObj.IsCameraInvisible();
++		oclScnObj.shadowInvisible = scnObj.IsShadowInvisible();
++		oclScnObj.lightLinkReceiverSet = scnObj.GetLightLinkReceiverSet();
+ 	}
+ }
+ 
+diff --git a/src/slg/engines/pathtracer.cpp b/src/slg/engines/pathtracer.cpp
+index 4917e3b..932b8b3 100644
+--- a/src/slg/engines/pathtracer.cpp
++++ b/src/slg/engines/pathtracer.cpp
+@@ -161,7 +161,8 @@ PathTracer::DirectLightResult PathTracer::DirectLightSampling(
+ 			&lightPickPdf
+ 		);
+ 
+-		if (light) {
++		// Light linking: the picked light may not illuminate this surface
++		if (light && light->IsLightLinkedTo(bsdf.GetLightLinkReceiverSet())) {
+ 			Ray shadowRay;
+ 			float directPdfW;
+ 			Spectrum lightRadiance = light->Illuminate(
+@@ -200,10 +201,18 @@ PathTracer::DirectLightResult PathTracer::DirectLightSampling(
+ 					Spectrum connectionThroughput;
+ 					// Create a new PathVolumeInfo for the path to the light source
+ 					PathVolumeInfo volInfo = pathInfo.volume;
+-					// Check if the light source is visible
+-					if (!scene.Intersect(IntersectionDevicePtr(&device), EYE_RAY | SHADOW_RAY, &volInfo, u4, &shadowRay,
++					// Check if the light source is visible (a light not casting
++					// shadows is always visible)
++					const bool castShadows = light->IsCastingShadows();
++					bool shadowed = false;
++					if (castShadows)
++						shadowed = scene.Intersect(IntersectionDevicePtr(&device), EYE_RAY | SHADOW_RAY, &volInfo, u4, &shadowRay,
+ 							&shadowRayHit, &shadowBsdf, &connectionThroughput, nullptr,
+-							nullptr, true)) {
++							nullptr, true);
++					else
++						connectionThroughput = Spectrum(1.f);
++
++					if (!shadowed) {
+ 						// Add the light contribution only if it is not a shadow catcher
+ 						// (because, if the light is visible, the material will be
+ 						// transparent in the case of a shadow catcher).
+@@ -228,6 +237,9 @@ PathTracer::DirectLightResult PathTracer::DirectLightSampling(
+ 							const bool misEnabled = !sampleResult->lastPathVertex &&
+ 								(light->IsEnvironmental() || light->IsIntersectable()) &&
+ 								CheckDirectHitVisibilityFlags(*light, directLightDepthInfo, event) &&
++								// BSDF sampling can not reach a light through the
++								// geometry so there is no MIS for lights not casting shadows
++								castShadows &&
+ 								!shadowBsdf.hitPoint.throughShadowTransparency;
+ 
+ 							const float weight = misEnabled ? PowerHeuristic(directLightSamplingPdfW, bsdfPdfW) : 1.f;
+@@ -274,6 +286,26 @@ bool PathTracer::CheckDirectHitVisibilityFlags(LightSourceConstRef lightSource,
+ 	return false;
+ }
+ 
++bool PathTracer::CheckDirectHitLightLinking(LightSourceConstRef lightSource,
++		const EyePathInfo &pathInfo) const {
++	// Camera rays always see light sources
++	if (pathInfo.depth.depth == 0)
++		return true;
++
++	return lightSource.IsLightLinkedTo(pathInfo.lastLightLinkReceiverSet);
++}
++
++bool PathTracer::CheckDirectHitCastShadows(LightSourceConstRef lightSource,
++		const EyePathInfo &pathInfo) const {
++	// Camera rays always see light sources. Otherwise, the light contribution
++	// of lights not casting shadows comes only from direct light sampling (if
++	// the light source has direct light sampling enabled and the last vertex
++	// was not specular, direct light sampling is not done on delta BSDFs).
++	return (pathInfo.depth.depth == 0) || lightSource.IsCastingShadows() ||
++			!lightSource.IsDirectLightSamplingEnabled() ||
++			(pathInfo.lastBSDFEvent & SPECULAR);
++}
++
+ void PathTracer::DirectHitFiniteLight(SceneConstRef scene,
+ 		const EyePathInfo &pathInfo,
+ 		const Spectrum &pathThroughput, const Ray &ray,
+@@ -284,6 +316,10 @@ void PathTracer::DirectHitFiniteLight(SceneConstRef scene,
+ 
+ 	// Check if the light source is visible according the settings
+ 	if (!CheckDirectHitVisibilityFlags(*lightSource, pathInfo.depth, pathInfo.lastBSDFEvent) ||
++			// Light linking: check if the light illuminates the previous path vertex
++			!CheckDirectHitLightLinking(*lightSource, pathInfo) ||
++			// Lights not casting shadows are handled only by direct light sampling
++			!CheckDirectHitCastShadows(*lightSource, pathInfo) ||
+ 			// If the material is shadow transparent, Direct Light sampling
+ 			// will take care of transporting all emitted light
+ 			bsdf.hitPoint.throughShadowTransparency)
+@@ -327,7 +363,9 @@ void PathTracer::DirectHitInfiniteLight(SceneConstRef scene,
+ 
+ 	for(EnvLightSource& envLight: scene.GetLightSources().GetEnvLightSources()) {
+ 		// Check if the light source is visible according the settings
+-		if (!CheckDirectHitVisibilityFlags(envLight, pathInfo.depth, pathInfo.lastBSDFEvent))
++		if (!CheckDirectHitVisibilityFlags(envLight, pathInfo.depth, pathInfo.lastBSDFEvent) ||
++				!CheckDirectHitLightLinking(envLight, pathInfo) ||
++				!CheckDirectHitCastShadows(envLight, pathInfo))
+ 			continue;
+ 
+ 		float directPdfW;
+diff --git a/src/slg/lights/light.cpp b/src/slg/lights/light.cpp
+index 7fa1828..881f282 100644
+--- a/src/slg/lights/light.cpp
++++ b/src/slg/lights/light.cpp
+@@ -34,6 +34,10 @@ PropertiesUPtr LightSource::ToProperties(const ImageMapCache &imgMapCache, const
+ 	auto props = std::make_unique<Properties>();
+ 	if (volume)
+ 		props->Set(Property(prefix + ".volume")(volume->GetName()));
++	if (lightLinkReceiverMask != LIGHTLINK_MASK_ALL)
++		props->Set(LightLinkReceiverMaskToProperty(prefix, lightLinkReceiverMask));
++	if (!castShadows)
++		props->Set(Property(prefix + ".castshadows")(false));
+ 
+ 	return props;
+ }
+diff --git a/src/slg/lights/lightlinking.cpp b/src/slg/lights/lightlinking.cpp
+new file mode 100644
+index 0000000..5103abd
+--- /dev/null
++++ b/src/slg/lights/lightlinking.cpp
+@@ -0,0 +1,69 @@
++/***************************************************************************
++ * Copyright 1998-2026 by authors (see AUTHORS.txt)                        *
++ *                                                                         *
++ *   This file is part of LuxCoreRender.                                   *
++ *                                                                         *
++ * Licensed under the Apache License, Version 2.0 (the "License");         *
++ * you may not use this file except in compliance with the License.        *
++ * You may obtain a copy of the License at                                 *
++ *                                                                         *
++ *     http://www.apache.org/licenses/LICENSE-2.0                          *
++ *                                                                         *
++ * Unless required by applicable law or agreed to in writing, software     *
++ * distributed under the License is distributed on an "AS IS" BASIS,       *
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.*
++ * See the License for the specific language governing permissions and     *
++ * limitations under the License.                                          *
++ ***************************************************************************/
++
++#include <stdexcept>
++
++#include "slg/lights/lightlinking.h"
++
++using namespace std;
++using namespace luxrays;
++
++namespace slg {
++
++u_int LightLinkParseReceiverSet(const Properties &props, const string &propName) {
++	const string name = propName + ".lightlink.receiverset";
++	if (!props.IsDefined(name))
++		return 0;
++
++	const u_int set = props.Get(name).Get<u_int>();
++	if (set >= LIGHTLINK_SET_COUNT)
++		throw runtime_error("Light linking receiver set out of range [0, " +
++				to_string(LIGHTLINK_SET_COUNT - 1) + "]: " + name);
++
++	return set;
++}
++
++LightLinkMask LightLinkParseReceiverMask(const Properties &props, const string &propName) {
++	const string name = propName + ".lightlink.receiversets";
++	if (!props.IsDefined(name))
++		return LIGHTLINK_MASK_ALL;
++
++	const Property &prop = props.Get(name);
++	LightLinkMask mask = 0ull;
++	for (u_int i = 0; i < prop.GetSize(); ++i) {
++		const u_int set = prop.Get<u_int>(i);
++		if (set >= LIGHTLINK_SET_COUNT)
++			throw runtime_error("Light linking receiver set out of range [0, " +
++					to_string(LIGHTLINK_SET_COUNT - 1) + "]: " + name);
++		mask |= (1ull << set);
++	}
++
++	return mask;
++}
++
++Property LightLinkReceiverMaskToProperty(const string &propName, const LightLinkMask mask) {
++	Property prop(propName + ".lightlink.receiversets");
++	for (u_int i = 0; i < LIGHTLINK_SET_COUNT; ++i) {
++		if (LightLinkMaskIncludes(mask, i))
++			prop.Add<u_int>(i);
++	}
++
++	return prop;
++}
++
++}
+diff --git a/src/slg/lights/trianglelight.cpp b/src/slg/lights/trianglelight.cpp
+index 54eeaaa..9971924 100644
+--- a/src/slg/lights/trianglelight.cpp
++++ b/src/slg/lights/trianglelight.cpp
+@@ -38,6 +38,14 @@ TriangleLight::TriangleLight() : sceneObject(nullptr),
+ TriangleLight::~TriangleLight() {
+ }
+ 
++bool TriangleLight::IsCastingShadows() const {
++	return sceneObject ? sceneObject->IsLightCastingShadows() : true;
++}
++
++LightLinkMask TriangleLight::GetLightLinkReceiverMask() const {
++	return sceneObject ? sceneObject->GetLightLinkReceiverMask() : LIGHTLINK_MASK_ALL;
++}
++
+ bool TriangleLight::IsDirectLightSamplingEnabled() const {
+ 	switch (lightMaterial->GetDirectLightSamplingType()) {
+ 		case DLS_AUTO: {
+diff --git a/src/slg/scene/parselights.cpp b/src/slg/scene/parselights.cpp
+index 9fec751..94b5228 100644
+--- a/src/slg/scene/parselights.cpp
++++ b/src/slg/scene/parselights.cpp
+@@ -533,6 +533,8 @@ LightSourceUPtr Scene::CreateLightSource(const string &name, const luxrays::Prop
+ 	lightSource->gain = props.Get(Property(propName + ".gain")(Spectrum(1.f))).Get<Spectrum>();
+ 	lightSource->SetID(props.Get(Property(propName + ".id")(0)).Get<int>());
+ 	lightSource->SetImportance(props.Get(Property(propName + ".importance")(1.0)).Get<double>());
++	lightSource->SetLightLinkReceiverMask(LightLinkParseReceiverMask(props, propName));
++	lightSource->SetCastShadows(props.Get(Property(propName + ".castshadows")(true)).Get<bool>());
+ 
+ 	if (!lightSource->IsIntersectable()) {
+ 		auto& nils = static_cast<NotIntersectableLightSource&>(*lightSource);
+diff --git a/src/slg/scene/parseobjects.cpp b/src/slg/scene/parseobjects.cpp
+index 0f52dc7..88d48ba 100644
+--- a/src/slg/scene/parseobjects.cpp
++++ b/src/slg/scene/parseobjects.cpp
+@@ -184,6 +184,10 @@ SceneObjectUPtr Scene::CreateObject(const u_int defaultObjID, const string &objN
+ 	// Build the scene object
+ 	auto scnObj = std::make_unique<SceneObject>(mesh, mat, objID, cameraInvisible);
+ 	scnObj->SetName(objName);
++	scnObj->SetShadowInvisible(props.Get(Property(propName + ".shadowinvisible")(false)).Get<bool>());
++	scnObj->SetLightLinkReceiverSet(LightLinkParseReceiverSet(props, propName));
++	scnObj->SetLightLinkReceiverMask(LightLinkParseReceiverMask(props, propName));
++	scnObj->SetLightCastShadows(props.Get(Property(propName + ".lightcastshadows")(true)).Get<bool>());
+ 
+ 	if (props.IsDefined(propName + ".bake.combined.file")) {
+ 		ImageMapUPtr imgMap = ImageMap::FromProperties(props, propName + ".bake.combined");
+@@ -263,6 +267,7 @@ void Scene::DuplicateObject(const std::string &srcObjName, const std::string &ds
+ 	auto dstObj = std::make_unique<SceneObject>(
+ 		newMesh, srcObj.GetMaterial(), objID, srcObj.IsCameraInvisible()
+ 	);
++	dstObj->CopyVisibilitySettings(srcObj);
+ 
+ 	dstObj->SetName(dstObjName);
+ 	auto [dstObjRef, oldObjPtr] = objDefs.DefineSceneObject(std::move(dstObj));
+@@ -330,6 +335,7 @@ void Scene::DuplicateObject(const std::string &srcObjName, const std::string &ds
+ 	auto dstObj = std::make_unique<SceneObject>(
+ 		newMesh, srcObj.GetMaterial(), objID, srcObj.IsCameraInvisible()
+ 	);
++	dstObj->CopyVisibilitySettings(srcObj);
+ 	dstObj->SetName(dstObjName);
+ 	auto [dstObjRef, oldObjPtr] = objDefs.DefineSceneObject(std::move(dstObj));
+ 
+diff --git a/src/slg/scene/scene.cpp b/src/slg/scene/scene.cpp
+index 31dcbd9..363ba16 100644
+--- a/src/slg/scene/scene.cpp
++++ b/src/slg/scene/scene.cpp
+@@ -809,6 +809,17 @@ bool Scene::Intersect(IntersectionDevicePtr device,
+ 				}
+ 			}
+ 
++			// Check if it is a shadow invisible object and we are tracing a shadow ray
++			if (!continueToTrace && shadowRay &&
++					objDefs.GetSceneObject(rayHit->meshIndex).IsShadowInvisible()) {
++				// Mark the connection like a pass through shadow transparency:
++				// BSDF sampling can not reach the light source through this
++				// object so MIS has to be disabled for this light sample
++				throughShadowTransparency = true;
++				bsdf->hitPoint.throughShadowTransparency = true;
++				continueToTrace = true;
++			}
++
+ 			if (!continueToTrace && shadowRay) {
+ 				const Spectrum &shadowTransparency = bsdf->GetPassThroughShadowTransparency();
+ 				
+diff --git a/src/slg/scene/sceneobject.cpp b/src/slg/scene/sceneobject.cpp
+index 9f1f345..4199686 100644
+--- a/src/slg/scene/sceneobject.cpp
++++ b/src/slg/scene/sceneobject.cpp
+@@ -64,6 +64,11 @@ PropertiesUPtr SceneObject::ToProperties(const ExtMeshCache &extMeshCache,
+ 		extMeshCache.GetRealFileName(mesh) : extMeshCache.GetSequenceFileName(mesh);
+ 	props->Set(Property("scene.objects." + name + ".ply")(fileName));
+ 	props->Set(Property("scene.objects." + name + ".camerainvisible")(cameraInvisible));
++	props->Set(Property("scene.objects." + name + ".shadowinvisible")(shadowInvisible));
++	props->Set(Property("scene.objects." + name + ".lightlink.receiverset")(lightLinkReceiverSet));
++	props->Set(Property("scene.objects." + name + ".lightcastshadows")(lightCastShadows));
++	if (lightLinkReceiverMask != LIGHTLINK_MASK_ALL)
++		props->Set(LightLinkReceiverMaskToProperty("scene.objects." + name, lightLinkReceiverMask));
+ 	props->Set(Property("scene.objects." + name + ".id")(objID));
+ 
+ 	switch (GetMesh().GetType()) {
+diff --git a/src/slg/utils/pathinfo.cpp b/src/slg/utils/pathinfo.cpp
+index 33ae68a..b45f2f2 100644
+--- a/src/slg/utils/pathinfo.cpp
++++ b/src/slg/utils/pathinfo.cpp
+@@ -52,7 +52,7 @@ bool PathInfo::CanBeNearlySpecular(const BSDF &bsdf, const float glossinessThres
+ 
+ EyePathInfo::EyePathInfo() : isPassThroughPath(true),
+ 		lastBSDFPdfW(1.f), lastGlossiness(0.f), lastFromVolume(false),
+-		isTransmittedPath(true), isNearlyCaustic(false) {
++		isTransmittedPath(true), lastLightLinkReceiverSet(0), isNearlyCaustic(false) {
+ }
+ 
+ void EyePathInfo::AddVertex(const BSDF &bsdf,
+@@ -101,6 +101,7 @@ void EyePathInfo::AddVertex(const BSDF &bsdf,
+ 	lastShadeN = bsdf.hitPoint.intoObject ? bsdf.hitPoint.shadeN : -bsdf.hitPoint.shadeN;
+ 	lastFromVolume =  bsdf.IsVolume();
+ 	lastGlossiness = glossiness;
++	lastLightLinkReceiverSet = bsdf.GetLightLinkReceiverSet();
+ 
+ 	isTransmittedPath = isTransmittedPath && (event & TRANSMIT) && (event & (SPECULAR | GLOSSY));
+ }
