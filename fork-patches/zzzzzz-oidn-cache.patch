@@ -1,0 +1,143 @@
+diff --git a/src/slg/film/imagepipeline/plugins/intel_oidn.cpp b/src/slg/film/imagepipeline/plugins/intel_oidn.cpp
+index 881d359..2e33f33 100644
+--- a/src/slg/film/imagepipeline/plugins/intel_oidn.cpp
++++ b/src/slg/film/imagepipeline/plugins/intel_oidn.cpp
+@@ -24,6 +24,8 @@
+ #include <boost/format.hpp>
+ 
+ #include <mutex>
++#include <map>
++#include <sstream>
+ 
+ #include <OpenImageDenoise/oidn.hpp>
+ #include <oneapi/tbb.h>
+@@ -94,8 +96,13 @@ namespace {
+ std::mutex oidnDeviceMutex;
+ lux::oidn::DeviceRef oidnCPUDevice, oidnGPUDevice;
+ bool oidnGPUDeviceFailed = false;
+-// Serializes the filters executed on the GPU device
+-std::mutex oidnGPUExecMutex;
++// Cached filters, see IntelOIDN::FilterImage()
++struct CachedOIDNFilter {
++	lux::oidn::FilterRef filter;
++	lux::oidn::BufferRef colorBuf, albedoBuf, normalBuf, outputBuf;
++};
++std::map<string, CachedOIDNFilter> oidnFilterCache;
++std::mutex oidnFilterCacheMutex;
+ 
+ lux::oidn::DeviceRef CreateOIDNDevice(const lux::oidn::DeviceType type) {
+ 	lux::oidn::DeviceRef device = lux::oidn::newDevice(type);
+@@ -269,49 +276,79 @@ void IntelOIDN::FilterImage(const string &imageName,
+ 	bool isGPU = false;
+ 	lux::oidn::DeviceRef device = GetOIDNDevice(useGPU, isGPU);
+ 
+-	// A GPU device runs one filter at a time
+-	std::unique_lock<std::mutex> gpuLock(oidnGPUExecMutex, std::defer_lock);
+-	if (isGPU)
+-		gpuLock.lock();
++	// Filters (with their device buffers) are cached: creating and committing
++	// a filter is much slower than executing it, which matters for the
++	// viewport, where the same image is denoised again and again.
++	std::lock_guard<std::mutex> lock(oidnFilterCacheMutex);
+ 
+-	// Device owned buffers: GPU devices can not access host memory directly
+ 	const size_t byteSize = (size_t)width * height * 3 * sizeof(float);
+-	lux::oidn::BufferRef colorBuf = device.newBuffer(byteSize);
+-	colorBuf.write(0, byteSize, srcBuffer);
+-	lux::oidn::BufferRef dstBuf = device.newBuffer(byteSize);
+-	lux::oidn::BufferRef albedoBuf, normalBuf;
+-
+-	lux::oidn::FilterRef filter = device.newFilter(filterType.c_str());
+-	filter.set("hdr", true);
+-	filter.set("cleanAux", cleanAux);
+-	filter.set("maxMemoryMB", oidnMemLimit);
+-	filter.set("quality", ParseOIDNQuality(quality));
+-	filter.setImage("color", colorBuf, lux::oidn::Format::Float3, width, height);
+-	if (albedoBuffer) {
+-		albedoBuf = device.newBuffer(byteSize);
+-		albedoBuf.write(0, byteSize, albedoBuffer);
+-		filter.setImage("albedo", albedoBuf, lux::oidn::Format::Float3, width, height);
+-
+-		// Normals can only be used if albedo is supplied as well
+-		if (normalBuffer) {
+-			normalBuf = device.newBuffer(byteSize);
+-			normalBuf.write(0, byteSize, normalBuffer);
+-			filter.setImage("normal", normalBuf, lux::oidn::Format::Float3, width, height);
++	const bool hasAlbedo = (albedoBuffer != nullptr);
++	const bool hasNormal = hasAlbedo && (normalBuffer != nullptr);
++	std::ostringstream keyStream;
++	keyStream << (isGPU ? "GPU" : "CPU") << "|" << imageName << "|" << filterType << "|"
++			<< width << "x" << height << "|" << quality << "|" << oidnMemLimit << "|"
++			<< hasAlbedo << hasNormal << cleanAux;
++	const string key = keyStream.str();
++
++	auto it = oidnFilterCache.find(key);
++	if (it == oidnFilterCache.end()) {
++		if (oidnFilterCache.size() >= 8)
++			oidnFilterCache.clear();
++
++		CachedOIDNFilter entry;
++		// Device owned buffers: GPU devices can not access host memory directly
++		entry.colorBuf = device.newBuffer(byteSize);
++		entry.outputBuf = device.newBuffer(byteSize);
++		entry.filter = device.newFilter(filterType.c_str());
++		entry.filter.set("hdr", true);
++		entry.filter.set("cleanAux", cleanAux);
++		entry.filter.set("maxMemoryMB", oidnMemLimit);
++		entry.filter.set("quality", ParseOIDNQuality(quality));
++		entry.filter.setImage("color", entry.colorBuf, lux::oidn::Format::Float3, width, height);
++		if (hasAlbedo) {
++			entry.albedoBuf = device.newBuffer(byteSize);
++			entry.filter.setImage("albedo", entry.albedoBuf, lux::oidn::Format::Float3, width, height);
++			// Normals can only be used if albedo is supplied as well
++			if (hasNormal) {
++				entry.normalBuf = device.newBuffer(byteSize);
++				entry.filter.setImage("normal", entry.normalBuf, lux::oidn::Format::Float3, width, height);
++			}
+ 		}
+-	}
++		entry.filter.setImage("output", entry.outputBuf, lux::oidn::Format::Float3, width, height);
++		entry.filter.commit();
+ 
+-	filter.setImage("output", dstBuf, lux::oidn::Format::Float3, width, height);
+-	filter.commit();
++		const char *errorMessage;
++		if (device.getError(errorMessage) != lux::oidn::Error::None) {
++			SLG_LOG("IntelOIDNPlugin " + imageName + " filter creation error: " << errorMessage);
++			return;
++		}
++		SLG_LOG("IntelOIDNPlugin created " + imageName + " filter on " << (isGPU ? "GPU" : "CPU")
++				<< " (" << width << "x" << height << ")");
++		it = oidnFilterCache.emplace(key, entry).first;
++	}
++	CachedOIDNFilter &entry = it->second;
+ 
+-	SLG_LOG("IntelOIDNPlugin executing " + imageName + " filter on " << (isGPU ? "GPU" : "CPU"));
+ 	const double startTime = WallClockTime();
+-	filter.execute();
+-	dstBuf.read(0, byteSize, dstBuffer);
+-	SLG_LOG("IntelOIDNPlugin " + imageName + " filter took: " << (boost::format("%.2f") % (WallClockTime() - startTime)) << "secs");
++	entry.colorBuf.write(0, byteSize, srcBuffer);
++	if (hasAlbedo)
++		entry.albedoBuf.write(0, byteSize, albedoBuffer);
++	if (hasNormal)
++		entry.normalBuf.write(0, byteSize, normalBuffer);
++	entry.filter.execute();
++	entry.outputBuf.read(0, byteSize, dstBuffer);
+ 
+ 	const char *errorMessage;
+-	if (device.getError(errorMessage) != lux::oidn::Error::None)
++	if (device.getError(errorMessage) != lux::oidn::Error::None) {
+ 		SLG_LOG("IntelOIDNPlugin " + imageName + " filtering error: " << errorMessage);
++		oidnFilterCache.erase(it);
++		return;
++	}
++
++	// Avoid flooding the log with the (frequent) viewport executions
++	const double elapsed = WallClockTime() - startTime;
++	if ((width * height > 1024 * 1024) || (elapsed > .5))
++		SLG_LOG("IntelOIDNPlugin " + imageName + " filter on " << (isGPU ? "GPU" : "CPU")
++				<< " took: " << (boost::format("%.2f") % elapsed) << "secs");
+ }
+ 
+ 
