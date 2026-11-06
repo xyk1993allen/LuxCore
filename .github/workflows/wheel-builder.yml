@@ -364,6 +364,15 @@ jobs:
 
 
       # Build wheel
+      - name: Install CUDA toolkit (GPU denoiser, Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.8.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.4.0
         env:
@@ -454,7 +463,7 @@ jobs:
             pip install "conan==2.21" && pip install wheel && make deps
 
           CIBW_BEFORE_ALL_WINDOWS: |
-            pip install "conan==2.21" && pip install wheel && make deps
+            pip install "conan==2.21" && pip install wheel && make deps && bash.exe ${{ env.WORKSPACE }}/build-system/wheels/build_oidn_cuda_windows.sh '${{ env.WORKSPACE }}'
 
 
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: |
